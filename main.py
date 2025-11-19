@@ -63,12 +63,25 @@ AZURE_CONTAINER = "meucontainer"
 TABLE_NAME = "Treinos"
 
 
-connection_string = (
-    f"DefaultEndpointsProtocol=https;"
-    f"AccountName={AZURE_ACCOUNT_NAME};"
-    f"AccountKey={AZURE_ACCOUNT_KEY};"
-    f"EndpointSuffix=core.windows.net"
-)
+# Prefer incoming connection string if fornecida (útil para CI / deploy)
+connection_string = os.getenv("AZURE_CONNECTION_STRING")
+
+if not connection_string:
+    ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
+    ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
+
+    if not ACCOUNT_NAME or not ACCOUNT_KEY:
+        raise RuntimeError(
+            "Azure credentials not found. Defina AZURE_CONNECTION_STRING ou "
+            "as variáveis AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY no seu ambiente."
+        )
+
+    connection_string = (
+        f"DefaultEndpointsProtocol=https;"
+        f"AccountName={ACCOUNT_NAME};"
+        f"AccountKey={ACCOUNT_KEY};"
+        f"EndpointSuffix=core.windows.net"
+    )
 
 # BLOB STORAGE
 blob_service = BlobServiceClient.from_connection_string(connection_string)
