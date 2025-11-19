@@ -7,6 +7,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # ADICIONAR ESTE BLOCO DE PERMISSÕES
+    permissions:
+      contents: read
+      packages: write 
 
     steps:
       - name: Checkout code
@@ -17,7 +21,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password: ${{ github.token }} # Mantendo o que você usou, mas secrets.GITHUB_TOKEN é o padrão
 
       - name: Build Docker Image
         run: |
@@ -26,4 +30,3 @@ jobs:
       - name: Push Docker Image
         run: |
           docker push ghcr.io/${{ github.repository }}/remote-ml:latest
-
