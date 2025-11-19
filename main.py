@@ -54,10 +54,14 @@ app.add_middleware(
 # CONFIGURAÇÃO DO AZURE STORAGE (BLOB + TABLE)
 # ============================================================
 
-AZURE_ACCOUNT_NAME = "storagecriptografia"
-AZURE_ACCOUNT_KEY  = "q6GznJ3k4CV1Bg2rdgC2gFGuMVfF3xp5zNFVy1sF3LXYGtJfXF0oxbKsG08DkkYBulHNth4znRsF+AStym1w8Q=="
-AZURE_CONTAINER    = "meucontainer"
-TABLE_NAME         = "Treinos"
+import os
+
+
+ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
+ACCOUNT_KEY  = os.getenv("AZURE_ACCOUNT_KEY")
+AZURE_CONTAINER = "meucontainer"
+TABLE_NAME = "Treinos"
+
 
 connection_string = (
     f"DefaultEndpointsProtocol=https;"
