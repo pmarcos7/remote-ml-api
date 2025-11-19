@@ -1,8 +1,12 @@
-name: Deploy Remote ML API
+name: Deploy Remote ML API 
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   build-and-deploy:
@@ -11,28 +15,27 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    # LOGIN GHCR
+    # Login GHCR
     - name: Login GHCR
       run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-    # BUILD IMAGE
+    # Build image
     - name: Build Docker image
       run: docker build -t ghcr.io/${{ github.actor }}/remote-ml:latest .
 
-    # PUSH IMAGE
+    # Push image
     - name: Push Docker image
       run: docker push ghcr.io/${{ github.actor }}/remote-ml:latest
 
-    # LOGIN AZURE
+    # Login Azure
     - name: Azure Login
       uses: azure/login@v1
       with:
         client-id: ${{ secrets.AZURE_APP_ID }}
         tenant-id: ${{ secrets.AZURE_TENANT }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION }}
-        client-secret: ${{ secrets.AZURE_SECRET }}
 
-    # DEPLOY
+    # Deploy to Azure Container Apps
     - name: Deploy to Azure Container Apps
       run: |
         az containerapp update \
