@@ -2,7 +2,7 @@ name: Deploy Remote ML API
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   build-and-deploy:
@@ -11,37 +11,28 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    # ========================================================
-    # 1. Login no GitHub Container Registry (GHCR)
-    # ========================================================
+    # LOGIN GHCR
     - name: Login GHCR
       run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-    # ========================================================
-    # 2. Build da imagem Docker
-    # ========================================================
+    # BUILD IMAGE
     - name: Build Docker image
       run: docker build -t ghcr.io/${{ github.actor }}/remote-ml:latest .
 
-    # ========================================================
-    # 3. Push da imagem
-    # ========================================================
+    # PUSH IMAGE
     - name: Push Docker image
       run: docker push ghcr.io/${{ github.actor }}/remote-ml:latest
 
-    # ========================================================
-    # 4. Instalar Azure CLI
-    # ========================================================
-    - name: Azure Login by CLI
-      run: |
-        az login --service-principal \
-          -u "<AZURE_APP_ID>" \
-          -p "<AZURE_SECRET>" \
-          --tenant "<AZURE_TENANT>"
+    # LOGIN AZURE
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_APP_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION }}
+        client-secret: ${{ secrets.AZURE_SECRET }}
 
-    # ========================================================
-    # 5. Deploy no Container Apps
-    # ========================================================
+    # DEPLOY
     - name: Deploy to Azure Container Apps
       run: |
         az containerapp update \
