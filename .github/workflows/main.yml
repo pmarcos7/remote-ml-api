@@ -1,0 +1,50 @@
+name: Deploy Remote ML API
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    # ========================================================
+    # 1. Login no GitHub Container Registry (GHCR)
+    # ========================================================
+    - name: Login GHCR
+      run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+    # ========================================================
+    # 2. Build da imagem Docker
+    # ========================================================
+    - name: Build Docker image
+      run: docker build -t ghcr.io/${{ github.actor }}/remote-ml:latest .
+
+    # ========================================================
+    # 3. Push da imagem
+    # ========================================================
+    - name: Push Docker image
+      run: docker push ghcr.io/${{ github.actor }}/remote-ml:latest
+
+    # ========================================================
+    # 4. Instalar Azure CLI
+    # ========================================================
+    - name: Azure Login by CLI
+      run: |
+        az login --service-principal \
+          -u "<AZURE_APP_ID>" \
+          -p "<AZURE_SECRET>" \
+          --tenant "<AZURE_TENANT>"
+
+    # ========================================================
+    # 5. Deploy no Container Apps
+    # ========================================================
+    - name: Deploy to Azure Container Apps
+      run: |
+        az containerapp update \
+          --name remote-ml-api \
+          --resource-group rg-remote-ml \
+          --image ghcr.io/${{ github.actor }}/remote-ml:latest
