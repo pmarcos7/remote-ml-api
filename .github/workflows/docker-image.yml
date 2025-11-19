@@ -1,28 +1,10 @@
-name: Build Docker Image
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
+ENV APP_DIR=/app/data
+RUN mkdir -p /app/data
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-on:
-  push:
-    branches: ["main"]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Build image
-        run: |
-          docker build . -t ghcr.io/${{ github.repository }}/remote-ml:latest
-
-      - name: Push image
-        run: |
-          docker push ghcr.io/${{ github.repository }}/remote-ml:latest
