@@ -149,14 +149,30 @@ async function uploadTrain(){
     document.getElementById('trainResult').innerText = JSON.stringify(j);
 }
 
-async function train(){
+async function train() {
     log('Iniciando treino...');
-    const res = await fetch(`${API_BASE}/train`, { method:'POST', body: new URLSearchParams({lags:5, cv_splits:5}) });
-    const j = await res.json();
-    log('Treino finalizado: ' + JSON.stringify(j));
-    document.getElementById('trainResult').innerText = JSON.stringify(j);
-    getLastMetrics();
+    try {
+        const res = await fetch(`${API_BASE}/train`, {
+            method: 'POST',
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: new URLSearchParams({ lags: 5, cv_splits: 5 })
+        });
+
+        const text = await res.text();  // <-- pega qualquer coisa, até HTML
+        log('Resposta bruta: ' + text);
+
+        const j = JSON.parse(text);
+        log('Treino finalizado: ' + JSON.stringify(j));
+        document.getElementById('trainResult').innerText = JSON.stringify(j);
+        getLastMetrics();
+    }
+    catch (e) {
+        log("ERRO no front: " + e);
+    }
 }
+
 
 async function uploadTest(){
     const f = document.getElementById('testFile').files[0];
@@ -396,53 +412,70 @@ async def upload_train(file: UploadFile = File(...)):
 # ============================================================
 
 @app.post("/train")
-async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
+async def train_model(
+    lags: int = Form(...),
+    cv_splits: int = Form(...)
+):
+    try:
+        print("Recebido:", lags, cv_splits)
 
-    df = pd.read_csv(io.BytesIO(download_from_blob("train_upload.csv")))
+        # Carregar dataset do Blob
+        df = pd.read_csv(io.BytesIO(download_from_blob("train_upload.csv")))
 
-    X, y = build_lags(df, lags=lags)
+        # Construir defasagens
+        X, y = build_lags(df, lags=lags)
 
-    scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X)
+        # Escalonamento
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
 
-    tscv = TimeSeriesSplit(n_splits=cv_splits)
-    maes, rmses, r2s = [], [], []
+        # Cross-validation
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        maes, rmses, r2s = [], [], []
 
-    for tr, val in tscv.split(X_scaled):
-        Xtr, Xval = X_scaled[tr], X_scaled[val]
-        ytr, yval = y.iloc[tr], y.iloc[val]
+        for tr, val in tscv.split(X_scaled):
+            Xtr, Xval = X_scaled[tr], X_scaled[val]
+            ytr, yval = y.iloc[tr], y.iloc[val]
 
-        m = LinearRegression()
-        m.fit(Xtr, ytr)
-        preds = m.predict(Xval)
+            m = LinearRegression()
+            m.fit(Xtr, ytr)
+            preds = m.predict(Xval)
 
-        maes.append(mean_absolute_error(yval, preds))
-        rmses.append(mean_squared_error(yval, preds, squared=False))
-        r2s.append(r2_score(yval, preds))
+            maes.append(mean_absolute_error(yval, preds))
+            rmses.append(mean_squared_error(yval, preds, squared=False))
+            r2s.append(r2_score(yval, preds))
 
-    model = LinearRegression()
-    model.fit(X_scaled, y)
+        # Treinar modelo final
+        model = LinearRegression()
+        model.fit(X_scaled, y)
 
-    # salvar no blob
-    b = io.BytesIO()
-    joblib.dump(model, b)
-    upload_to_blob("model.joblib", b.getvalue())
+        # Salvar modelo no Blob
+        b = io.BytesIO()
+        joblib.dump(model, b)
+        upload_to_blob("model.joblib", b.getvalue())
 
-    b = io.BytesIO()
-    joblib.dump(scaler, b)
-    upload_to_blob("scaler.joblib", b.getvalue())
+        # Salvar scaler no Blob
+        b = io.BytesIO()
+        joblib.dump(scaler, b)
+        upload_to_blob("scaler.joblib", b.getvalue())
 
-    # registrar no banco
-    registrar_treino(np.mean(maes), np.mean(rmses), np.mean(r2s))
+        # Registrar métricas no banco
+        registrar_treino(np.mean(maes), np.mean(rmses), np.mean(r2s))
 
-    metrics = {
-        "MAE": float(np.mean(maes)),
-        "RMSE": float(np.mean(rmses)),
-        "R2": float(np.mean(r2s))
-    }
+        metrics = {
+            "MAE": float(np.mean(maes)),
+            "RMSE": float(np.mean(rmses)),
+            "R2": float(np.mean(r2s))
+        }
 
-    return {"status": "trained", "metrics": metrics}
+        return {"status": "trained", "metrics": metrics}
 
+    except Exception as e:
+        print("ERRO NO TREINO:", str(e))
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Erro no processo de treino: {str(e)}"
+        )
 
 # ============================================================
 # ENDPOINT: UPLOAD TEST
