@@ -37,7 +37,6 @@ origins = [
     "http://localhost:9000", # se você acessar swagger nessa porta
     "http://127.0.0.1:9000",
     "null", # <<< IMPORTANTE: Para permitir 'file://' (HTML local)
-    "*"# opcional: permitir todos (apenas dev)
 ]
 
 app.add_middleware(
@@ -56,8 +55,7 @@ app.add_middleware(
 # ATENÇÃO: SUBSTITUA ESTE VALOR pela URL completa do seu Container App!
 API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io" 
 
-# O código HTML completo do seu dashboard como uma string Python (Tripla-Aspas)
-HTML_DASHBOARD = f"""
+HTML_TEMPLATE = """
 <!doctype html>
 <html lang="pt-BR">
 <head>
@@ -65,17 +63,17 @@ HTML_DASHBOARD = f"""
     <title>ML Remote — Dashboard</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <style>
-        body{{font-family:Inter,system-ui,Segoe UI,Arial;padding:18px;background:#f6f8fb;color:#111}}
-        h1{{margin:0 0 10px}}
-        .box{{background:#fff;border-radius:8px;padding:14px;margin-bottom:12px;box-shadow:0 1px 4px rgba(10,10,10,0.06)}}
-        label{{display:block;margin:8px 0 6px;font-weight:600}}
-        button{{padding:8px 12px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}}
-        input[type=file]{{padding:6px}}
-        table{{width:100%;border-collapse:collapse;margin-top:8px}}
-        th,td{{padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px}}
-        .row{{display:flex;gap:12px;flex-wrap:wrap}}
-        .col{{flex:1;min-width:240px}}
-        pre{{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}}
+        body{font-family:Inter,system-ui,Segoe UI,Arial;padding:18px;background:#f6f8fb;color:#111}
+        h1{margin:0 0 10px}
+        .box{background:#fff;border-radius:8px;padding:14px;margin-bottom:12px;box-shadow:0 1px 4px rgba(10,10,10,0.06)}
+        label{display:block;margin:8px 0 6px;font-weight:600}
+        button{padding:8px 12px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}
+        input[type=file]{padding:6px}
+        table{width:100%;border-collapse:collapse;margin-top:8px}
+        th,td{padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px}
+        .row{display:flex;gap:12px;flex-wrap:wrap}
+        .col{flex:1;min-width:240px}
+        pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
     </style>
 </head>
 <body>
@@ -127,11 +125,11 @@ HTML_DASHBOARD = f"""
     </div>
 
 <script>
-const API_BASE = "{API_URL}"; // Usa a URL injetada do Python
+const API_BASE = "__API_URL__";
 
 function log(msg){
     const c = document.getElementById('console');
-    c.textContent = ` ${{new Date().toISOString()}} — ${{msg}}\n` + c.textContent;
+    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
 }
 
 async function uploadTrain(){
@@ -140,7 +138,7 @@ async function uploadTrain(){
     const fd = new FormData();
     fd.append('file', f);
     log('Enviando treino...');
-    const res = await fetch(` ${{API_BASE}}/upload/train`, { method:'POST', body: fd });
+    const res = await fetch(`${API_BASE}/upload/train`, { method:'POST', body: fd });
     const j = await res.json();
     log('Upload train: ' + JSON.stringify(j));
     document.getElementById('trainResult').innerText = JSON.stringify(j);
@@ -148,11 +146,10 @@ async function uploadTrain(){
 
 async function train(){
     log('Iniciando treino...');
-    const res = await fetch(` ${{API_BASE}}/train`, { method:'POST', body: new URLSearchParams({lags:5, cv_splits:5}) });
+    const res = await fetch(`${API_BASE}/train`, { method:'POST', body: new URLSearchParams({lags:5, cv_splits:5}) });
     const j = await res.json();
     log('Treino finalizado: ' + JSON.stringify(j));
     document.getElementById('trainResult').innerText = JSON.stringify(j);
-    // mostrar última métrica
     getLastMetrics();
 }
 
@@ -162,7 +159,7 @@ async function uploadTest(){
     const fd = new FormData();
     fd.append('file', f);
     log('Enviando teste...');
-    const res = await fetch(` ${{API_BASE}}/upload/test`, { method:'POST', body: fd });
+    const res = await fetch(`${API_BASE}/upload/test`, { method:'POST', body: fd });
     const j = await res.json();
     log('Upload test: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
@@ -170,16 +167,15 @@ async function uploadTest(){
 
 async function predict(){
     log('Rodando predict...');
-    const res = await fetch(` ${{API_BASE}}/predict`, { method:'POST' });
+    const res = await fetch(`${API_BASE}/predict`, { method:'POST' });
     const j = await res.json();
     log('Predict: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
-    // baixar preview das previsões (pode demorar se estiver no blob)
     await showPredictionsPreview();
 }
 
 async function downloadPredictions(){
-    const url = ` ${{API_BASE}}/download/predictions`;
+    const url = `${API_BASE}/download/predictions`;
     log('Baixando ' + url);
     const a = document.createElement('a');
     a.href = url;
@@ -191,7 +187,7 @@ async function downloadPredictions(){
 
 async function getLastMetrics(){
     try{
-        const res = await fetch(` ${{API_BASE}}/metrics/last`);
+        const res = await fetch(`${API_BASE}/metrics/last`);
         const j = await res.json();
         log('Último treino: ' + JSON.stringify(j));
         document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
@@ -202,11 +198,10 @@ async function getLastMetrics(){
 
 let logsCache = [];
 async function getLogs(){
-    const res = await fetch(` ${{API_BASE}}/logs`);
+    const res = await fetch(`${API_BASE}/logs`);
     const j = await res.json();
     logsCache = j.logs || [];
     log('Logs recebidos: ' + logsCache.length);
-    // montar tabela simples
     const html = ['<table><thead><tr><th>RowKey</th><th>timestamp</th><th>MAE</th><th>RMSE</th><th>R2</th></tr></thead><tbody>'];
     for(const it of logsCache){
         html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
@@ -223,7 +218,7 @@ function exportLogsCSV(){
         const row = cols.map(c => JSON.stringify(it[c] ?? '')).join(',');
         lines.push(row);
     }
-    const blob = new Blob([lines.join('\n')], {type:'text/csv;charset=utf-8;'});
+    const blob = new Blob([lines.join('\\n')], {type:'text/csv;charset=utf-8;'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -237,23 +232,23 @@ function exportLogsCSV(){
 
 async function showPredictionsPreview(){
     try{
-        // baixa o CSV gerado e mostra as 10 primeiras linhas
-        const res = await fetch(` ${{API_BASE}}/download/predictions`);
+        const res = await fetch(`${API_BASE}/download/predictions`);
         if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
         const txt = await res.text();
-        const lines = txt.trim().split('\n').slice(0, 11).join('\n');
+        const lines = txt.trim().split('\\n').slice(0, 11).join('\\n');
         document.getElementById('predPreview').innerText = lines;
     }catch(e){
         log('Erro preview: ' + e);
     }
 }
 
-// inicial
 log('Frontend pronto. API base: ' + API_BASE);
 </script>
 </body>
 </html>
 """
+
+HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
 
 # Rota Raiz para servir o HTML
 @app.get("/", response_class=HTMLResponse)
