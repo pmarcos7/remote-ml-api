@@ -46,17 +46,11 @@ jobs:
 # 6. Deploy no Azure Container Apps (SOLUÇÃO SIMPLIFICADA E FINAL)
       - name: Deploy to Azure Container Apps
         run: |
-          # 1. ATUALIZA A IMAGEM (Comando que seu AZ CLI sempre reconhece)
           az containerapp update \
             --name remote-ml-api \
             --resource-group rg-remote-ml \
-            --image ghcr.io/${{ github.repository }}/remote-ml:latest
-          
-          # 2. DEFINE O INGRESS E A PORTA (Usando o comando 'ingress set' para evitar o erro de sintaxe)
-          az containerapp ingress set \
-            --name remote-ml-api \
-            --resource-group rg-remote-ml \
-            --external \
+            --ingress external \
             --target-port 8000 \
-            --transport auto
-                  
+            --transport auto \
+            --image ghcr.io/${{ github.repository }}/remote-ml:latest
+                        
