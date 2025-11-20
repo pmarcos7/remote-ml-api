@@ -125,7 +125,7 @@ HTML_TEMPLATE = """
     </div>
 
 <script>
-const API_BASE = "__API_URL__";
+const API_BASE = "{API_URL}"; // Usa a URL injetada do Python
 
 function log(msg){
     const c = document.getElementById('console');
