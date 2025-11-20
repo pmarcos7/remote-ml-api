@@ -3,8 +3,7 @@
 # ============================================================
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse, HTMLResponse # MODIFICADO: Adicionado HTMLResponse
-from fastapi.staticfiles import StaticFiles # ADICIONADO: Para servir arquivos estáticos (se necessário)
+from fastapi.responses import FileResponse, HTMLResponse 
 from azure.storage.blob import BlobServiceClient
 from azure.data.tables import TableServiceClient
 import pandas as pd
@@ -32,11 +31,12 @@ app = FastAPI(title="ML Remote API with Azure Storage + Banco Gratuito")
 # 2. AGORA CONFIGURE O CORS (usando a variável 'app' que existe)
 # ============================================================
 origins = [
-    "http://localhost:8080", # onde vamos servir o frontend
+    "http://localhost:8080",
     "http://127.0.0.1:8080",
-    "http://localhost:9000", # se você acessar swagger nessa porta
+    "http://localhost:9000",
     "http://127.0.0.1:9000",
-    "null", # <<< IMPORTANTE: Para permitir 'file://' (HTML local)
+    "null",
+    "*" # Permissão ampla, útil para ambientes de teste como o ACA
 ]
 
 app.add_middleware(
@@ -49,12 +49,13 @@ app.add_middleware(
 
 
 # ============================================================
-# 3. FRONEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO)
+# 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
 # ============================================================
 
 # ATENÇÃO: SUBSTITUA ESTE VALOR pela URL completa do seu Container App!
 API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io" 
 
+# HTML_DASHBOARD NÃO É MAIS UMA F-STRING, USA .replace() PARA EVITAR CONFLITOS DE CHAVES {}
 HTML_TEMPLATE = """
 <!doctype html>
 <html lang="pt-BR">
@@ -125,12 +126,16 @@ HTML_TEMPLATE = """
     </div>
 
 <script>
-const API_BASE = "{API_URL}"; // Usa a URL injetada do Python
+// CORREÇÃO AQUI: A URL da API é injetada via Python antes de ser servida
+const API_BASE = "__API_URL__"; 
 
 function log(msg){
     const c = document.getElementById('console');
-    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
+    // CORRIGIDO: Removido caracteres de escape desnecessários para o navegador
+    c.textContent = `${new Date().toISOString()} — ${msg}\\n` + c.textContent; 
 }
+
+// O restante das suas funções JS (uploadTrain, train, etc.) usam API_BASE corretamente.
 
 async function uploadTrain(){
     const f = document.getElementById('trainFile').files[0];
@@ -258,8 +263,7 @@ async def serve_frontend_embedded():
 
 
 # ============================================================
-# 4. AGORA CONTINUE COM O RESTO DO SEU CÓDIGO (Antiga Seção 3)
-# CONFIGURAÇÃO DO AZURE STORAGE (BLOB + TABLE)
+# 4. CONFIGURAÇÃO DO AZURE STORAGE (BLOB + TABLE)
 # ============================================================
 
 import os
@@ -271,36 +275,37 @@ AZURE_CONTAINER = "meucontainer"
 TABLE_NAME = "Treinos"
 
 
-# Prefer incoming connection string if fornecida (útil para CI / deploy)
-connection_string = os.getenv("AZURE_CONNECTION_STRING")
-
-if not connection_string:
-    ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
-    ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
-
-    if not ACCOUNT_NAME or not ACCOUNT_KEY:
-        raise RuntimeError(
-            "Azure credentials not found. Defina AZURE_CONNECTION_STRING ou "
-            "as variáveis AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY no seu ambiente."
-        )
-
-    connection_string = (
-        f"DefaultEndpointsProtocol=https;"
-        f"AccountName={ACCOUNT_NAME};"
-        f"AccountKey={ACCOUNT_KEY};"
-        f"EndpointSuffix=core.windows.net"
+# Removendo a lógica desnecessária de AZURE_CONNECTION_STRING e apenas verificando
+# se as variáveis necessárias para a Connection String existem.
+if not ACCOUNT_NAME or not ACCOUNT_KEY:
+    # Este erro será disparado se as variáveis do ACA não estiverem sendo injetadas corretamente
+    raise RuntimeError(
+        "Azure credentials not found. Certifique-se de que as variáveis "
+        "AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY estão configuradas como SEGREDOS."
     )
 
+connection_string = (
+    f"DefaultEndpointsProtocol=https;"
+    f"AccountName={ACCOUNT_NAME};"
+    f"AccountKey={ACCOUNT_KEY};"
+    f"EndpointSuffix=core.windows.net"
+)
+
 # BLOB STORAGE
-blob_service = BlobServiceClient.from_connection_string(connection_string)
-container = blob_service.get_container_client(AZURE_CONTAINER)
+# A falha pode ocorrer aqui se a connection_string for inválida
+try:
+    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    container = blob_service.get_container_client(AZURE_CONTAINER)
+except Exception as e:
+    raise RuntimeError(f"Falha crítica ao conectar ao Blob Storage: {e}")
 
 # TABLE STORAGE (BANCO GRATUITO)
-table_service = TableServiceClient.from_connection_string(connection_string)
 try:
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    # Tentar criar a tabela, se falhar, apenas obtê-la
     table_client = table_service.create_table_if_not_exists(TABLE_NAME)
-except:
-    table_client = table_service.get_table_client(TABLE_NAME)
+except Exception as e:
+    raise RuntimeError(f"Falha crítica ao conectar ao Table Storage: {e}")
 
 
 def registrar_treino(mae, rmse, r2):
@@ -309,9 +314,10 @@ def registrar_treino(mae, rmse, r2):
         "RowKey": str(uuid.uuid4()),
         "timestamp": datetime.utcnow().isoformat(),
         "MAE": float(mae),
-        "RMSE": float(rmse),
+        "RMSE": float(float(rmse)),
         "R2": float(r2)
     }
+    # ESTA CHAMADA É QUE DEVE ESTAR FALHANDO NO 500
     table_client.create_entity(entity)
 
 
@@ -378,7 +384,10 @@ def build_lags(df, lags=5, target="time"):
 async def upload_train(file: UploadFile = File(...)):
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
-    upload_to_blob("train_upload.csv", contents)
+    
+    # Esta linha faz upload para o Azure Blob Storage, que pode ser o ponto de falha 500.
+    upload_to_blob("train_upload.csv", contents) 
+    
     return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
 
 
