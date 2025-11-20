@@ -34,7 +34,15 @@ jobs:
 
       - name: Deploy to Azure Container Apps
         run: |
+          # Atualiza imagem
           az containerapp update \
             --name remote-ml-api \
             --resource-group rg-remote-ml \
             --image ghcr.io/${{ github.repository }}/remote-ml:latest
+
+          # GARANTE que a porta 8000 está configurada
+          az containerapp ingress update \
+            --name remote-ml-api \
+            --resource-group rg-remote-ml \
+            --external true \
+            --target-port 8000
