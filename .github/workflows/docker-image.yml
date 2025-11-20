@@ -1,16 +1,16 @@
-name: Build and Push Docker Image
+name: Build and Deploy Remote ML API
 
 on:
   push:
     branches: ["main"]
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    # ADICIONAR ESTE BLOCO DE PERMISSÕES
+
     permissions:
       contents: read
-      packages: write 
+      packages: write      
 
     steps:
       - name: Checkout code
@@ -21,7 +21,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }} # Mantendo o que você usou, mas secrets.GITHUB_TOKEN é o padrão
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Docker Image
         run: |
@@ -30,3 +30,17 @@ jobs:
       - name: Push Docker Image
         run: |
           docker push ghcr.io/${{ github.repository }}/remote-ml:latest
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Container Apps
+        run: |
+          az containerapp update \
+            --name remote-ml-api \
+            --resource-group rg-remote-ml \
+            --image ghcr.io/${{ github.repository }}/remote-ml:latest \
+            --container-name remote-ml-api \
+            --set properties.configuration.ingress.targetPort=8000
