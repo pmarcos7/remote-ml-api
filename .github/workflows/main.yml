@@ -13,11 +13,9 @@ jobs:
       packages: write
 
     steps:
-      # 1. Checkout
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # 2. Login GHCR
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -25,42 +23,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. Build image
       - name: Build Docker Image
         run: |
           docker build -t ghcr.io/${{ github.repository }}/remote-ml:latest .
 
-      # 4. Push image
       - name: Push Docker Image
         run: |
           docker push ghcr.io/${{ github.repository }}/remote-ml:latest
 
-      # 5. Login Azure
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 6. Atualiza a extensão containerapp (ESSENCIAL)
       - name: Update ContainerApp extension
         run: |
-          az extension remove -n containerapp || true
-          az extension add -n containerapp
-          az extension update -n containerapp
+          az extension add -n containerapp --upgrade --yes
 
-      # 7. Deploy com retry (evita erro "operation in progress")
-      - name: Deploy to Azure Container Apps (with retry)
+      - name: Deploy and fix ingress/port
         run: |
-          for i in {1..10}; do
-            echo "Tentativa $i de 10..."
-            if az containerapp update \
-              --name remote-ml-api \
-              --resource-group rg-remote-ml \
-              --image ghcr.io/${{ github.repository }}/remote-ml:latest \
-              --container-name remote-ml-api ; then
-              echo "Deploy realizado com sucesso!"
-              break
-            fi
-            echo "Falhou. Aguardando 20 segundos..."
-            sleep 20
-          done
+          az containerapp update \
+            --name remote-ml-api \
+            --resource-group rg-remote-ml \
+            --image ghcr.io/${{ github.repository }}/remote-ml:latest
+
+          az containerapp ingress enable \
+            --name remote-ml-api \
+            --resource-group rg-remote-ml \
+            --target-port 8000 \
+            --type external
