@@ -419,17 +419,13 @@ async def train_model(
     try:
         print("Recebido:", lags, cv_splits)
 
-        # Carregar dataset do Blob
         df = pd.read_csv(io.BytesIO(download_from_blob("train_upload.csv")))
 
-        # Construir defasagens
         X, y = build_lags(df, lags=lags)
 
-        # Escalonamento
         scaler = MinMaxScaler()
         X_scaled = scaler.fit_transform(X)
 
-        # Cross-validation
         tscv = TimeSeriesSplit(n_splits=cv_splits)
         maes, rmses, r2s = [], [], []
 
@@ -442,24 +438,24 @@ async def train_model(
             preds = m.predict(Xval)
 
             maes.append(mean_absolute_error(yval, preds))
-            rmses.append(mean_squared_error(yval, preds, squared=False))
+
+            mse = mean_squared_error(yval, preds)
+            rmse = np.sqrt(mse)
+            rmses.append(rmse)
+
             r2s.append(r2_score(yval, preds))
 
-        # Treinar modelo final
         model = LinearRegression()
         model.fit(X_scaled, y)
 
-        # Salvar modelo no Blob
         b = io.BytesIO()
         joblib.dump(model, b)
         upload_to_blob("model.joblib", b.getvalue())
 
-        # Salvar scaler no Blob
         b = io.BytesIO()
         joblib.dump(scaler, b)
         upload_to_blob("scaler.joblib", b.getvalue())
 
-        # Registrar métricas no banco
         registrar_treino(np.mean(maes), np.mean(rmses), np.mean(r2s))
 
         metrics = {
@@ -473,9 +469,10 @@ async def train_model(
     except Exception as e:
         print("ERRO NO TREINO:", str(e))
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Erro no processo de treino: {str(e)}"
         )
+
 
 # ============================================================
 # ENDPOINT: UPLOAD TEST
