@@ -7,17 +7,14 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # 1. PERMISSÕES: Adicionadas para garantir o Push no GHCR
     permissions:
       contents: read
       packages: write 
 
     steps:
-      # 1. Baixar o código
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # 2. Login no GitHub Container Registry
       - name: Login to GHCR
         uses: docker/login-action@v2
         with:
@@ -25,32 +22,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. Build da imagem Docker
       - name: Build Docker image
         run: |
           docker build -t ghcr.io/${{ github.repository }}/remote-ml:latest .
 
-      # 4. Push da imagem
       - name: Push Docker image
         run: |
           docker push ghcr.io/${{ github.repository }}/remote-ml:latest
 
-      # 5. Login no Azure via Service Principal
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 6. Deploy no Azure Container Apps (COM CORREÇÃO DE PORTA)
-      # 6. Deploy no Azure Container Apps (SOLUÇÃO FINAL)
-# 6. Deploy no Azure Container Apps (SOLUÇÃO SIMPLIFICADA E FINAL)
+      # 6. Deploy no Azure Container Apps (SOLUÇÃO DEFINITIVA)
       - name: Deploy to Azure Container Apps
         run: |
+          # 1. ATUALIZA A IMAGEM (Comando universalmente reconhecido)
           az containerapp update \
             --name remote-ml-api \
             --resource-group rg-remote-ml \
-            --ingress external \
-            --target-port 8000 \
-            --transport auto \
             --image ghcr.io/${{ github.repository }}/remote-ml:latest
-                        
+          
+          # 2. DEFINE O INGRESS E A PORTA (Comando 'ingress set' para evitar o erro de sintaxe)
+          # Isso garante que a porta 8000 seja configurada.
+          az containerapp ingress set \
+            --name remote-ml-api \
+            --resource-group rg-remote-ml \
+            --external \
+            --target-port 8000 \
+            --transport auto
