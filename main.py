@@ -13,6 +13,8 @@
 # - Mantém comportamento original (upload, train, predict, download)
 # ============================================================
 
+# main.py - API de Regressão Linear Remota (corrigido, tudo em um bloco)
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, HTMLResponse
 from azure.storage.blob import BlobServiceClient
@@ -34,7 +36,10 @@ from sklearn.model_selection import TimeSeriesSplit
 from fastapi.middleware.cors import CORSMiddleware
 
 # Cosmos (opcional)
-from azure.cosmos import CosmosClient
+try:
+    from azure.cosmos import CosmosClient
+except Exception:
+    CosmosClient = None  # se não estiver instalado, continuamos sem cosmos
 
 # --------------------
 # CONFIGURAÇÕES E VARIÁVEIS
@@ -48,11 +53,11 @@ TABLE_NAME = os.getenv("TABLE_NAME", "Treinos")
 COSMOS_URI = os.getenv("COSMOS_URI")
 COSMOS_KEY = os.getenv("COSMOS_KEY")
 COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME", "remote-ml")
-COSMOS_CONTAINER_NAME = os.getenv("COSMOS_CONTAINER_NAME", "logs")
+COSMOS_TRAININGS_CONTAINER = os.getenv("COSMOS_TRAININGS_CONTAINER", "training_runs")
+COSMOS_PREDICTIONS_CONTAINER = os.getenv("COSMOS_PREDICTIONS_CONTAINER", "predictions")
 
-# Verificações iniciais mínimas
+# Verificações iniciais mínimas para Blob/Table
 if not AZURE_ACCOUNT_NAME or not AZURE_ACCOUNT_KEY:
-    # raise RuntimeError -> preferir falhar rápido para que o deploy seja corrigido
     raise RuntimeError(
         "Azure credentials not found. Defina AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY como secrets."
     )
@@ -70,6 +75,11 @@ connection_string = (
 try:
     blob_service = BlobServiceClient.from_connection_string(connection_string)
     blob_container = blob_service.get_container_client(AZURE_CONTAINER)
+    # cria container se não existir (ignore erro se já existe)
+    try:
+        blob_container.create_container()
+    except Exception:
+        pass
 except Exception as e:
     raise RuntimeError(f"Falha ao conectar ao Blob Storage: {e}")
 
@@ -79,31 +89,37 @@ try:
 except Exception as e:
     raise RuntimeError(f"Falha ao conectar ao Table Storage: {e}")
 
-# Cosmos: inicializa apenas se as variáveis existirem
+# --------------------
+# INICIALIZAÇÃO DO COSMOS (opcional)
+# --------------------
 cosmos_enabled = False
 cosmos_client = None
 cosmos_db = None
-cosmos_container = None
-if COSMOS_URI and COSMOS_KEY:
+cosmos_trainings = None
+cosmos_predictions = None
+
+if COSMOS_URI and COSMOS_KEY and CosmosClient is not None:
     try:
         cosmos_client = CosmosClient(COSMOS_URI, credential=COSMOS_KEY)
-        cosmos_db = cosmos_client.create_database_if_not_exists(COSMOS_DB_NAME)
-        cosmos_container = cosmos_db.create_container_if_not_exists(
-            id=COSMOS_CONTAINER_NAME,
-            partition_key="/type"
+        cosmos_db = cosmos_client.create_database_if_not_exists(id=COSMOS_DB_NAME)
+        cosmos_trainings = cosmos_db.create_container_if_not_exists(
+            id=COSMOS_TRAININGS_CONTAINER,
+            partition_key="/id"  # partition key simples para runs
+        )
+        cosmos_predictions = cosmos_db.create_container_if_not_exists(
+            id=COSMOS_PREDICTIONS_CONTAINER,
+            partition_key="/training_id"
         )
         cosmos_enabled = True
     except Exception as e:
-        # Não falhar o app inteiro por causa do Cosmos: registrar e continuar
-        print("Aviso: falha ao conectar no Cosmos DB:", e)
+        # não falhar o app inteiro por causa do Cosmos, apenas logar
+        print("Aviso: não foi possível inicializar Cosmos DB:", e)
         cosmos_enabled = False
 
 # --------------------
 # HELPERS
 # --------------------
-
 def safe_float(x):
-    """Converte tipos numpy e similares para float do Python."""
     try:
         return float(x)
     except Exception:
@@ -111,7 +127,6 @@ def safe_float(x):
             return float(np.asarray(x).item())
         except Exception:
             return None
-
 
 def write_log_cosmos(log_type, message, data=None):
     if not cosmos_enabled:
@@ -124,20 +139,16 @@ def write_log_cosmos(log_type, message, data=None):
             "message": message,
             "data": data or {}
         }
-        # garante que id é string e partition key exista
         if "type" not in item or not item["type"]:
             item["type"] = "info"
-        cosmos_container.upsert_item(item)
+        cosmos_trainings.upsert_item(item)  # uso train container para logs simples
     except Exception as e:
-        print("Erro ao gravar no Cosmos:", e)
-
+        print("Erro ao gravar log no Cosmos:", e)
 
 def registrar_treino(mae, rmse, r2):
-    # converter para tipos primitivos do Python
     mae_v = safe_float(mae)
     rmse_v = safe_float(rmse)
     r2_v = safe_float(r2)
-
     entity = {
         "PartitionKey": "Treinos",
         "RowKey": str(uuid.uuid4()),
@@ -148,17 +159,14 @@ def registrar_treino(mae, rmse, r2):
     }
     try:
         table_client.create_entity(entity)
-        # também grava no Cosmos (opcional)
-        write_log_cosmos("treino", "Treino registrado", {"MAE": mae_v, "RMSE": rmse_v, "R2": r2_v})
+        write_log_cosmos("treino", "Treino registrado na Table Storage", {"MAE": mae_v, "RMSE": rmse_v, "R2": r2_v})
     except Exception as e:
         print("Erro ao registrar treino na Table Storage:", e)
-        # relançar para que endpoints que dependem do registro falhem com 500, se necessário
         raise
 
 # --------------------
 # HELPERS BLOB
 # --------------------
-
 def upload_to_blob(blob_name: str, data: bytes):
     try:
         blob_container.upload_blob(name=blob_name, data=data, overwrite=True)
@@ -166,15 +174,14 @@ def upload_to_blob(blob_name: str, data: bytes):
         print(f"Erro upload blob {blob_name}: {e}")
         raise
 
-
 def download_from_blob(blob_name: str) -> bytes:
     try:
         blob = blob_container.get_blob_client(blob_name)
-        return blob.download_blob().readall()
+        downloader = blob.download_blob()
+        return downloader.readall()
     except Exception as e:
         print(f"Erro download blob {blob_name}: {e}")
         raise
-
 
 def delete_blob(blob_name: str):
     try:
@@ -183,33 +190,68 @@ def delete_blob(blob_name: str):
         pass
 
 # --------------------
-# Função de construção de lags (mantida)
+# build_lags
 # --------------------
-
 def build_lags(df, lags=5, target="time"):
+    # se já tem colunas lag1..lagN, usa direto
     if all(f"lag{i}" in df.columns for i in range(1, lags + 1)):
         X = df[[f"lag{i}" for i in range(1, lags + 1)]]
         y = df[target]
         return X, y
-
     if target not in df.columns:
         raise ValueError("A coluna 'time' não foi encontrada no CSV.")
-
     s = df[target].astype(float)
-
     data = {f"lag{i}": s.shift(i) for i in range(1, lags + 1)}
     data[target] = s
     new_df = pd.DataFrame(data).dropna().reset_index(drop=True)
-
     X = new_df[[f"lag{i}" for i in range(1, lags + 1)]]
     y = new_df[target]
-
     return X, y
+
+# --------------------
+# Cosmos helpers específicos (training_runs / predictions)
+# --------------------
+def save_training_run_to_cosmos(summary, model_params, metrics, model_blob_name, scaler_blob_name=None):
+    if not cosmos_enabled:
+        return None
+    training_id = str(uuid.uuid4())
+    item = {
+        "id": training_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "inputSummary": summary,
+        "modelParams": model_params,
+        "metrics": metrics,
+        "model_blob": model_blob_name,
+        "scaler_blob": scaler_blob_name
+    }
+    try:
+        cosmos_trainings.create_item(item)
+    except Exception as e:
+        print("Erro ao salvar training_run no Cosmos:", e)
+        raise
+    return training_id
+
+def save_prediction_to_cosmos(training_id, input_row, output_value):
+    if not cosmos_enabled:
+        return None
+    pred = {
+        "id": str(uuid.uuid4()),
+        "training_id": training_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "input": input_row,
+        "output": float(output_value)
+    }
+    try:
+        cosmos_predictions.create_item(pred)
+    except Exception as e:
+        print("Erro ao salvar prediction no Cosmos:", e)
+        raise
+    return pred["id"]
 
 # --------------------
 # FASTAPI APP
 # --------------------
-app = FastAPI(title="ML Remote API with Azure Storage + Banco Gratuito")
+app = FastAPI(title="ML Remote API with Azure Storage + Cosmos + Table Storage")
 
 origins = [
     "http://localhost:8080",
@@ -228,10 +270,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Frontend embutido (mantido)
-API_URL = os.getenv("API_URL", "http://localhost:8000")
-HTML_TEMPLATE = """[...TRUNCATED FOR BREVITY IN FILE]"""
-HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
+# pequeno HTML para teste
+API_URL = os.getenv("API_URL", "/")
+HTML_DASHBOARD = f"""
+<!doctype html><html><head><meta charset="utf-8"><title>Remote ML</title></head><body>
+<h2>Remote ML API</h2>
+<p>Endpoints: /upload/train, /train, /upload/test, /predict, /download/predictions, /logs, /metrics/last</p>
+<p>API base: {API_URL}</p>
+</body></html>
+"""
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend_embedded():
@@ -240,7 +287,6 @@ async def serve_frontend_embedded():
 # --------------------
 # Endpoints: uploads
 # --------------------
-
 @app.post("/upload/train")
 async def upload_train(file: UploadFile = File(...)):
     contents = await file.read()
@@ -248,15 +294,12 @@ async def upload_train(file: UploadFile = File(...)):
         df = pd.read_csv(io.BytesIO(contents))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"CSV inválido: {e}")
-
     try:
         upload_to_blob("train_upload.csv", contents)
     except Exception as e:
         print("Erro ao enviar treino para blob:", e)
         raise HTTPException(status_code=500, detail="Falha ao salvar arquivo de treino no Blob Storage")
-
     return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
-
 
 @app.post("/upload/test")
 async def upload_test(file: UploadFile = File(...)):
@@ -265,23 +308,19 @@ async def upload_test(file: UploadFile = File(...)):
         df = pd.read_csv(io.BytesIO(contents))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"CSV inválido: {e}")
-
     try:
         upload_to_blob("test_upload.csv", contents)
     except Exception as e:
         print("Erro ao enviar teste para blob:", e)
         raise HTTPException(status_code=500, detail="Falha ao salvar arquivo de teste no Blob Storage")
-
     return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
 
 # --------------------
 # Train endpoint
 # --------------------
-
 @app.post("/train")
-async def train_model(lags: int = Form(...), cv_splits: int = Form(...)):
+async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
     try:
-        # baixar CSV
         data = download_from_blob("train_upload.csv")
         df = pd.read_csv(io.BytesIO(data))
 
@@ -308,24 +347,53 @@ async def train_model(lags: int = Form(...), cv_splits: int = Form(...)):
         model = LinearRegression()
         model.fit(X_scaled, y)
 
+        # salvar model + scaler no blob com timestamp
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        model_blob_name = f"model_{ts}.joblib"
+        scaler_blob_name = f"scaler_{ts}.joblib"
+
         b = io.BytesIO()
         joblib.dump(model, b)
-        upload_to_blob("model.joblib", b.getvalue())
+        upload_to_blob(model_blob_name, b.getvalue())
 
         b2 = io.BytesIO()
         joblib.dump(scaler, b2)
-        upload_to_blob("scaler.joblib", b2.getvalue())
+        upload_to_blob(scaler_blob_name, b2.getvalue())
 
-        # registrar no Table Storage (convertendo tipos)
-        registrar_treino(np.mean(maes), np.mean(rmses), np.mean(r2s))
-
+        # preparar resumo e params
+        summary = {
+            "rows": int(len(df)),
+            "columns": list(df.columns),
+            "target": "time",
+            "count": int(len(y)),
+            "min": float(y.min()),
+            "max": float(y.max()),
+            "mean": float(y.mean())
+        }
+        model_params = {
+            "coef": [float(c) for c in model.coef_.tolist()],
+            "intercept": float(model.intercept_)
+        }
         metrics = {
             "MAE": float(np.mean(maes)),
             "RMSE": float(np.mean(rmses)),
             "R2": float(np.mean(r2s))
         }
 
-        return {"status": "trained", "metrics": metrics}
+        # salvar run no cosmos (opcional)
+        training_id = None
+        try:
+            training_id = save_training_run_to_cosmos(summary, model_params, metrics, model_blob_name, scaler_blob_name)
+        except Exception as e:
+            print("Aviso: falha ao salvar training_run no Cosmos:", e)
+
+        # registrar em Table Storage (log simples)
+        try:
+            registrar_treino(metrics["MAE"], metrics["RMSE"], metrics["R2"])
+        except Exception as e:
+            print("Aviso: falha ao registrar na Table Storage:", e)
+
+        return {"status": "trained", "metrics": metrics, "training_id": training_id, "model_blob": model_blob_name}
 
     except HTTPException:
         raise
@@ -334,69 +402,108 @@ async def train_model(lags: int = Form(...), cv_splits: int = Form(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Erro no processo de treino: {e}")
 
-
 # --------------------
 # Predict endpoint
 # --------------------
-
 @app.post("/predict")
-async def predict():
+async def predict(training_id: str = Form(None), lags: int = Form(5)):
     try:
-        model = joblib.load(io.BytesIO(download_from_blob("model.joblib")))
-        scaler = joblib.load(io.BytesIO(download_from_blob("scaler.joblib")))
-        df = pd.read_csv(io.BytesIO(download_from_blob("test_upload.csv")))
+        # decidir qual model/scaler usar
+        model_blob = None
+        scaler_blob = None
+        if training_id and cosmos_enabled:
+            # buscar run no cosmos
+            query = f"SELECT * FROM c WHERE c.id = '{training_id}'"
+            docs = list(cosmos_trainings.query_items(query=query, enable_cross_partition_query=True))
+            if not docs:
+                raise HTTPException(status_code=404, detail="training_id não encontrado no Cosmos")
+            doc = docs[0]
+            model_blob = doc.get("model_blob")
+            scaler_blob = doc.get("scaler_blob")
+        else:
+            # fallback: pega o mais recente pelo nome (busca blob list)
+            # tenta pegar "model_*.joblib" mais recente
+            try:
+                blobs = list(blob_container.list_blobs(name_starts_with="model_"))
+                if blobs:
+                    # escolher o mais recente por last_modified
+                    blobs_sorted = sorted(blobs, key=lambda b: b.last_modified or datetime.min, reverse=True)
+                    model_blob = blobs_sorted[0].name
+                blobs_s = list(blob_container.list_blobs(name_starts_with="scaler_"))
+                if blobs_s:
+                    blobs_s_sorted = sorted(blobs_s, key=lambda b: b.last_modified or datetime.min, reverse=True)
+                    scaler_blob = blobs_s_sorted[0].name
+            except Exception:
+                # se falhar, assume nomes padrão
+                model_blob = model_blob or "model.joblib"
+                scaler_blob = scaler_blob or "scaler.joblib"
+
+        if not model_blob:
+            raise HTTPException(status_code=404, detail="Modelo não encontrado no Blob Storage")
+
+        model = joblib.load(io.BytesIO(download_from_blob(model_blob)))
+        scaler = joblib.load(io.BytesIO(download_from_blob(scaler_blob))) if scaler_blob else None
+
+        # ler test csv do blob
+        data = download_from_blob("test_upload.csv")
+        df = pd.read_csv(io.BytesIO(data))
 
         has_labels = "time" in df.columns
+        X, y = build_lags(df, lags=lags)
 
-        X, y = build_lags(df, lags=5)
-        X_scaled = scaler.transform(X)
+        X_scaled = scaler.transform(X) if scaler is not None else X
         preds = model.predict(X_scaled)
 
         out = pd.DataFrame({"predicted": preds})
-
         if has_labels:
             out["actual"] = y.values[:len(preds)]
             out["error"] = out["actual"] - out["predicted"]
 
+        # salvar CSV de previsões
         b = io.BytesIO()
         out.to_csv(b, index=False)
         upload_to_blob("predictions.csv", b.getvalue())
 
+        # salvar cada predição no Cosmos
+        saved = []
+        if cosmos_enabled:
+            for i, row in out.iterrows():
+                input_row = X.iloc[i].to_dict()
+                try:
+                    pid = save_prediction_to_cosmos(training_id or "unknown", input_row, float(row["predicted"]))
+                    saved.append(pid)
+                except Exception as e:
+                    print("Aviso: falha ao salvar prediction no Cosmos:", e)
+
         # opcional: gravar log no cosmos
-        try:
-            write_log_cosmos("predict", "Predição executada", {"n": len(preds)})
-        except Exception:
-            pass
+        write_log_cosmos("predict", "Predição executada", {"n": len(preds), "training_id": training_id})
 
-        return {"status": "ok"}
+        return {"status": "ok", "n": len(preds), "saved_ids": saved}
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("Erro no predict:", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Erro no predict: {e}")
 
-
 # --------------------
 # Download predictions
 # --------------------
-
 @app.get("/download/predictions")
 async def download_predictions():
     try:
         data = download_from_blob("predictions.csv")
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=404, detail="Nenhuma previsão disponível")
-
     path = "/tmp/predictions.csv"
     with open(path, "wb") as f:
         f.write(data)
     return FileResponse(path, filename="predictions.csv")
 
-
 # --------------------
 # Logs e métricas
 # --------------------
-
 @app.get("/logs")
 async def logs():
     try:
@@ -405,7 +512,6 @@ async def logs():
     except Exception as e:
         print("Erro ao listar treinos:", e)
         raise HTTPException(status_code=500, detail="Falha ao listar logs")
-
 
 @app.get("/metrics/last")
 async def last_metrics():
@@ -419,11 +525,9 @@ async def last_metrics():
         print("Erro ao buscar métricas:", e)
         raise HTTPException(status_code=500, detail="Falha ao obter última métrica")
 
-
 # --------------------
 # Reset
 # --------------------
-
 @app.post("/reset")
 async def reset():
     for f in ["train_upload.csv", "test_upload.csv", "model.joblib", "scaler.joblib", "predictions.csv"]:
@@ -432,6 +536,7 @@ async def reset():
         except Exception:
             pass
     return {"status": "reset"}
+
 
 # ============================================================
 # 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
