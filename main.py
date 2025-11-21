@@ -267,7 +267,7 @@ async def predictions_table():
         # Retorna JSON sempre válido com mensagem de erro
         return {"predictions_table": [], "error": str(e)}
     
-    
+
 @app.get("/logs")
 async def logs():
     items = list(table_client.list_entities())
@@ -520,7 +520,46 @@ async function getCosmosLogs(){
         document.getElementById('metrics').innerText = 'Erro ao buscar logs Cosmos: ' + e.message;
     }
 }
+async function getTablePredictions(){
+    try{
+        const res = await fetch(`${API_BASE}/predictions/table`);
+        const j = await res.json();
+        const predictions = j.predictions_table || []; // A rota retorna 'predictions_table'
+        log('Logs de predição recebidos: ' + predictions.length);
 
+        if (predictions.length === 0) {
+            document.getElementById('metrics').innerHTML = '<h4>Log de Predições (Table)</h4><p>Nenhum log de predição encontrado.</p>';
+            return;
+        }
+
+        // Obtém dinamicamente as colunas de lag para o header da tabela
+        const firstPrediction = predictions[0];
+        // Filtra e pega as chaves de entrada que começam com 'lag'
+        const lagKeys = Object.keys(firstPrediction.InputLags).sort(); 
+
+        let header = ['<th>ID Treino (PK)</th>', '<th>timestamp</th>', '<th>Valor Previsto</th>'];
+        lagKeys.forEach(k => header.push(`<th>${k}</th>`));
+
+        const html = ['<h4>Log de Predições (Azure Table Storage - Últimas 10)</h4><table><thead><tr>', header.join(''), '</tr></thead><tbody>'];
+
+        for(const it of predictions.slice(0, 10)){ // Limita a 10 linhas
+            let row = [`<tr>
+                <td>${it.PartitionKey.substring(0,8)}...</td>
+                <td>${it.timestamp.substring(0,19).replace('T', ' ')}</td>
+                <td>${(it.PredictedValue || 0).toFixed(4)}</td>`];
+            
+            lagKeys.forEach(k => row.push(`<td>${(it.InputLags[k] || 'n/a')}</td>`));
+            row.push('</tr>');
+            html.push(row.join(''));
+        }
+
+        html.push('</tbody></table>');
+        document.getElementById('metrics').innerHTML = html.join('');
+    }catch(e){
+        log('Erro ao buscar predições Table: ' + e.message);
+        document.getElementById('metrics').innerText = 'Erro ao buscar predições Table: ' + e.message;
+    }
+}
 // Substitui getCosmosPredictions
 async function getPredictionsTable(){
     try{
