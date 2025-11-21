@@ -48,6 +48,8 @@ AZURE_ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
 AZURE_ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
 AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "meucontainer")
 TABLE_NAME = os.getenv("TABLE_NAME", "Treinos")
+# NOVO: Nome da tabela para predições
+PREDICTIONS_TABLE_NAME = os.getenv("PREDICTIONS_TABLE_NAME", "Predicoes") 
 
 # Cosmos (opcional)
 COSMOS_URI = os.getenv("COSMOS_URI")
@@ -85,7 +87,10 @@ except Exception as e:
 
 try:
     table_service = TableServiceClient.from_connection_string(connection_string)
+    # Cliente para a tabela de treinos (já existente)
     table_client = table_service.create_table_if_not_exists(TABLE_NAME)
+    # NOVO: Cliente para a tabela de predições
+    predictions_table_client = table_service.create_table_if_not_exists(PREDICTIONS_TABLE_NAME)
 except Exception as e:
     raise RuntimeError(f"Falha ao conectar ao Table Storage: {e}")
 
@@ -145,6 +150,22 @@ def write_log_cosmos(log_type, message, data=None):
     except Exception as e:
         print("Erro ao gravar log no Cosmos:", e)
 
+# NOVO: Função para registrar predição na Tabela Azure
+def registrar_predicao(training_id, input_row, predicted_value):
+    entity = {
+        "PartitionKey": training_id or "unknown", # Usamos o training_id como PartitionKey
+        "RowKey": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat(),
+        "PredictedValue": safe_float(predicted_value),
+        # Adiciona os valores de entrada (lag features) como propriedades
+        **{f"lag{k}": safe_float(v) for k, v in input_row.items() if str(k).startswith('lag')}
+    }
+    try:
+        predictions_table_client.create_entity(entity)
+    except Exception as e:
+        print("Erro ao registrar predição na Table Storage:", e)
+        pass 
+        
 def registrar_treino(mae, rmse, r2):
     mae_v = safe_float(mae)
     rmse_v = safe_float(rmse)
@@ -464,13 +485,23 @@ async def predict(training_id: str = Form(None), lags: int = Form(5)):
         out.to_csv(b, index=False)
         upload_to_blob("predictions.csv", b.getvalue())
 
-        # salvar cada predição no Cosmos
+        # salvar cada predição no Cosmos E na nova Tabela Azure
         saved = []
-        if cosmos_enabled:
-            for i, row in out.iterrows():
-                input_row = X.iloc[i].to_dict()
+        training_run_id = training_id or "unknown" 
+
+        for i, row in out.iterrows():
+            input_row = X.iloc[i].to_dict()
+            
+            # 1. Salvar no Azure Table Storage (nova tabela 'Predicoes')
+            try:
+                registrar_predicao(training_run_id, input_row, float(row["predicted"]))
+            except Exception as e:
+                print(f"Aviso: falha ao salvar prediction na Table Storage: {e}")
+                
+            # 2. Salvar no Cosmos (código existente)
+            if cosmos_enabled:
                 try:
-                    pid = save_prediction_to_cosmos(training_id or "unknown", input_row, float(row["predicted"]))
+                    pid = save_prediction_to_cosmos(training_run_id, input_row, float(row["predicted"]))
                     saved.append(pid)
                 except Exception as e:
                     print("Aviso: falha ao salvar prediction no Cosmos:", e)
@@ -534,6 +565,36 @@ async def logs():
         raise HTTPException(status_code=500, detail="Falha ao listar logs")
 
 # --------------------
+# NOVO: Logs das Predições na Tabela Azure
+# --------------------
+@app.get("/predictions/table")
+async def predictions_table():
+    try:
+        # Lista as últimas 50 entidades da tabela Predicoes
+        items = list(predictions_table_client.list_entities(results_per_page=50))
+        
+        # O Table Storage não permite ordenação, mas list_entities() geralmente retorna por RowKey
+        # Vamos reformatar para facilitar a leitura
+        predictions_list = []
+        for item in items:
+            pred = {
+                "RowKey": item.RowKey,
+                "PartitionKey": item.PartitionKey,
+                "timestamp": item.timestamp.isoformat(),
+                "PredictedValue": item.PredictedValue,
+                "InputLags": {k: v for k, v in item.items() if str(k).startswith('lag')}
+            }
+            predictions_list.append(pred)
+
+        # Ordenar por timestamp (o table_client não garante a ordem)
+        predictions_list.sort(key=lambda x: x["timestamp"], reverse=True)
+        
+        return {"predictions_table": predictions_list}
+    except Exception as e:
+        print("Erro ao listar predições da Table Storage:", e)
+        raise HTTPException(status_code=500, detail=f"Falha ao listar predições da Table Storage: {e}")
+
+# --------------------
 # Logs e métricas - Cosmos
 # --------------------
 @app.get("/logs/cosmos")
@@ -584,8 +645,6 @@ async def reset():
         except Exception:
             pass
     return {"status": "reset"}
-
-
 # ============================================================
 # 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
 # ============================================================
