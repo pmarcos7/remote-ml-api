@@ -500,7 +500,27 @@ async def download_predictions():
     with open(path, "wb") as f:
         f.write(data)
     return FileResponse(path, filename="predictions.csv")
-
+# --------------------
+# Predições salvas no Cosmos
+# --------------------
+@app.get("/predictions/cosmos")
+async def predictions_cosmos(training_id: str = None):
+    if not cosmos_enabled:
+        raise HTTPException(status_code=400, detail="Cosmos DB não está habilitado (faltam credenciais)")
+    try:
+        if training_id:
+            # Consulta as últimas 50 predições para um training_id específico
+            query = f"SELECT TOP 50 * FROM c WHERE c.training_id = '{training_id}' ORDER BY c.timestamp DESC"
+        else:
+            # Consulta as últimas 50 predições de forma geral (pode ser lento se não usar partição)
+            query = "SELECT TOP 50 * FROM c ORDER BY c.timestamp DESC"
+            
+        items = list(cosmos_predictions.query_items(query=query, enable_cross_partition_query=True))
+        
+        return {"predictions_cosmos": items}
+    except Exception as e:
+        print("Erro ao listar predições do Cosmos:", e)
+        raise HTTPException(status_code=500, detail=f"Falha ao listar predições do Cosmos: {e}")
 # --------------------
 # Logs e métricas
 # --------------------
@@ -512,6 +532,34 @@ async def logs():
     except Exception as e:
         print("Erro ao listar treinos:", e)
         raise HTTPException(status_code=500, detail="Falha ao listar logs")
+
+# --------------------
+# Logs e métricas - Cosmos
+# --------------------
+@app.get("/logs/cosmos")
+async def logs_cosmos():
+    if not cosmos_enabled:
+        raise HTTPException(status_code=400, detail="Cosmos DB não está habilitado (faltam credenciais)")
+    try:
+        # Consulta para os últimos 50 logs de treino, ordenados pelo mais recente
+        query = "SELECT TOP 50 * FROM c ORDER BY c.timestamp DESC"
+        # Usamos o container de trainings pois ele armazena os logs simples e os summaries dos treinos
+        items = list(cosmos_trainings.query_items(query=query, enable_cross_partition_query=True))
+        
+        # Limita o tamanho dos campos de dados para visualização
+        for item in items:
+            if "data" in item and isinstance(item["data"], dict):
+                item["data_summary"] = str(item["data"])[:50] + "..." if len(str(item["data"])) > 50 else str(item["data"])
+                del item["data"]
+            if "modelParams" in item:
+                item["modelParams_summary"] = str(item["modelParams"])[:50] + "..." if len(str(item["modelParams"])) > 50 else str(item["modelParams"])
+                del item["modelParams"]
+        
+        return {"logs_cosmos": items}
+    except Exception as e:
+        print("Erro ao listar logs do Cosmos:", e)
+        raise HTTPException(status_code=500, detail=f"Falha ao listar logs do Cosmos: {e}")
+
 
 @app.get("/metrics/last")
 async def last_metrics():
@@ -596,10 +644,13 @@ HTML_TEMPLATE = """
 
         <div class="col">
             <h3>3) Logs e Métricas</h3>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <button onclick="getLastMetrics()">Último treino (Table)</button>
+                <button onclick="getLogs()">Ver logs (Table)</button>
+            </div>
             <div style="display:flex;gap:8px;align-items:center">
-                <button onclick="getLastMetrics()">Último treino</button>
-                <button onclick="getLogs()">Ver logs</button>
-                <button onclick="exportLogsCSV()">Exportar logs (CSV)</button>
+                <button onclick="getCosmosLogs()">Ver logs (Cosmos)</button>
+                <button onclick="getCosmosPredictions()">Ver Predições (Cosmos)</button>
             </div>
             <div id="metrics" style="margin-top:8px"></div>
         </div>
@@ -752,6 +803,44 @@ async function showPredictionsPreview(){
         log('Erro preview: ' + e);
     }
 }
+
+async function getCosmosLogs(){
+    try{
+        const res = await fetch(`${API_BASE}/logs/cosmos`);
+        const j = await res.json();
+        log('Logs Cosmos recebidos: ' + j.logs_cosmos.length);
+        const html = ['<table><thead><tr><th>Type</th><th>ID</th><th>Timestamp</th><th>Message/Summary</th></tr></thead><tbody>'];
+        for(const it of j.logs_cosmos){
+            const summary = it.data_summary || it.modelParams_summary || it.message || 'N/A';
+            html.push(`<tr><td>${it.type}</td><td>${it.id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${summary}</td></tr>`);
+        }
+        html.push('</tbody></table>');
+        document.getElementById('metrics').innerHTML = '<h4>Logs Cosmos DB (Training Runs)</h4>' + html.join('');
+    }catch(e){
+        log('Erro ao buscar logs Cosmos: ' + e);
+        document.getElementById('metrics').innerText = 'Erro ao buscar logs Cosmos: ' + e.message;
+    }
+}
+
+async function getCosmosPredictions(){
+    try{
+        const res = await fetch(`${API_BASE}/predictions/cosmos`);
+        const j = await res.json();
+        log('Predições Cosmos recebidas: ' + j.predictions_cosmos.length);
+        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Input</th><th>Output</th></tr></thead><tbody>'];
+        for(const it of j.predictions_cosmos){
+            const input_summary = JSON.stringify(it.input).substring(0, 30) + "...";
+            html.push(`<tr><td>${it.id.substring(0,8)}...</td><td>${it.training_id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${input_summary}</td><td>${it.output}</td></tr>`);
+        }
+        html.push('</tbody></table>');
+        document.getElementById('metrics').innerHTML = '<h4>Predições Cosmos DB</h4>' + html.join('');
+    }catch(e){
+        log('Erro ao buscar predições Cosmos: ' + e);
+        document.getElementById('metrics').innerText = 'Erro ao buscar predições Cosmos: ' + e.message;
+    }
+}
+
+
 
 log('Frontend pronto. API base: ' + API_BASE);
 </script>
