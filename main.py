@@ -230,20 +230,44 @@ async def download_predictions():
 
 @app.get("/predictions/table")
 async def predictions_table():
-    items = list(predictions_table_client.list_entities(results_per_page=50))
-    predictions_list = []
-    for item in items:
-        pred = {
-            "RowKey": item.RowKey,
-            "PartitionKey": item.PartitionKey,
-            "timestamp": item.timestamp.isoformat(),
-            "PredictedValue": item.PredictedValue,
-            "InputLags": {k: v for k, v in item.items() if str(k).startswith('lag')}
-        }
-        predictions_list.append(pred)
-    predictions_list.sort(key=lambda x: x["timestamp"], reverse=True)
-    return {"predictions_table": predictions_list}
+    try:
+        items = list(predictions_table_client.list_entities(results_per_page=50))
+        predictions_list = []
+        for item in items:
+            # Tenta converter timestamp para isoformat; se falhar, usa string ou None
+            try:
+                ts = item.timestamp.isoformat() if hasattr(item.timestamp, 'isoformat') else str(item.timestamp)
+            except Exception:
+                ts = str(item.timestamp)
 
+            # PredictedValue seguro
+            predicted = safe_float(getattr(item, "PredictedValue", None))
+
+            # Input lags seguros
+            input_lags = {}
+            for k, v in item.items():
+                if str(k).startswith("lag"):
+                    input_lags[k] = safe_float(v)
+
+            predictions_list.append({
+                "RowKey": getattr(item, "RowKey", ""),
+                "PartitionKey": getattr(item, "PartitionKey", ""),
+                "timestamp": ts,
+                "PredictedValue": predicted,
+                "InputLags": input_lags
+            })
+
+        # Ordena pelo timestamp mais recente
+        predictions_list.sort(key=lambda x: x["timestamp"], reverse=True)
+        return {"predictions_table": predictions_list}
+
+    except Exception as e:
+        # Log do traceback no servidor
+        print("Erro /predictions/table:", traceback.format_exc())
+        # Retorna JSON sempre válido com mensagem de erro
+        return {"predictions_table": [], "error": str(e)}
+    
+    
 @app.get("/logs")
 async def logs():
     items = list(table_client.list_entities())
