@@ -117,9 +117,6 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return "<h2>API Machine Learning Remota</h2>"
 
 # ------------------------------------------------------
 # UPLOADS
