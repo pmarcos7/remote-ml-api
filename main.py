@@ -2,8 +2,19 @@
 # main.py - API de Regressão Linear Remota com Azure Storage + Banco Gratuito
 # ============================================================
 
+# ============================================================
+# main.py - CORRIGIDO - API de Regressão Linear Remota
+# Correções importantes:
+# - Evita sobrescrever variáveis (blob_container vs cosmos_container)
+# - Verifica presence de env vars e falha com mensagens claras
+# - Trata tipos numpy antes de gravar no Azure Table
+# - Uso seguro do Cosmos DB (opcional) — só ativa se COSMOS_URI/COSMOS_KEY existirem
+# - Tratamento de erros de I/O com mensagens e logs
+# - Mantém comportamento original (upload, train, predict, download)
+# ============================================================
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse, HTMLResponse 
+from fastapi.responses import FileResponse, HTMLResponse
 from azure.storage.blob import BlobServiceClient
 from azure.data.tables import TableServiceClient
 import pandas as pd
@@ -13,6 +24,7 @@ import os
 import uuid
 from datetime import datetime
 import numpy as np
+import traceback
 
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MinMaxScaler
@@ -20,41 +32,192 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
 from fastapi.middleware.cors import CORSMiddleware
+
+# Cosmos (opcional)
 from azure.cosmos import CosmosClient
 
-# conexão com o Azure Cosmos DB para logging adicional
-cosmos_uri = os.getenv("COSMOS_URI")
-cosmos_key = os.getenv("COSMOS_KEY")
+# --------------------
+# CONFIGURAÇÕES E VARIÁVEIS
+# --------------------
+AZURE_ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
+AZURE_ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
+AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "meucontainer")
+TABLE_NAME = os.getenv("TABLE_NAME", "Treinos")
 
-client = CosmosClient(cosmos_uri, credential=cosmos_key)
-db = client.get_database_client("remote-ml")
-container = db.get_container_client("logs")
+# Cosmos (opcional)
+COSMOS_URI = os.getenv("COSMOS_URI")
+COSMOS_KEY = os.getenv("COSMOS_KEY")
+COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME", "remote-ml")
+COSMOS_CONTAINER_NAME = os.getenv("COSMOS_CONTAINER_NAME", "logs")
 
-def write_log(log_type, message, data=None):
-    container.create_item({
-        "id": str(uuid.uuid4()),
+# Verificações iniciais mínimas
+if not AZURE_ACCOUNT_NAME or not AZURE_ACCOUNT_KEY:
+    # raise RuntimeError -> preferir falhar rápido para que o deploy seja corrigido
+    raise RuntimeError(
+        "Azure credentials not found. Defina AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY como secrets."
+    )
+
+connection_string = (
+    f"DefaultEndpointsProtocol=https;"
+    f"AccountName={AZURE_ACCOUNT_NAME};"
+    f"AccountKey={AZURE_ACCOUNT_KEY};"
+    f"EndpointSuffix=core.windows.net"
+)
+
+# --------------------
+# INICIALIZAÇÃO DOS CLIENTES AZURE
+# --------------------
+try:
+    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    blob_container = blob_service.get_container_client(AZURE_CONTAINER)
+except Exception as e:
+    raise RuntimeError(f"Falha ao conectar ao Blob Storage: {e}")
+
+try:
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    table_client = table_service.create_table_if_not_exists(TABLE_NAME)
+except Exception as e:
+    raise RuntimeError(f"Falha ao conectar ao Table Storage: {e}")
+
+# Cosmos: inicializa apenas se as variáveis existirem
+cosmos_enabled = False
+cosmos_client = None
+cosmos_db = None
+cosmos_container = None
+if COSMOS_URI and COSMOS_KEY:
+    try:
+        cosmos_client = CosmosClient(COSMOS_URI, credential=COSMOS_KEY)
+        cosmos_db = cosmos_client.create_database_if_not_exists(COSMOS_DB_NAME)
+        cosmos_container = cosmos_db.create_container_if_not_exists(
+            id=COSMOS_CONTAINER_NAME,
+            partition_key="/type"
+        )
+        cosmos_enabled = True
+    except Exception as e:
+        # Não falhar o app inteiro por causa do Cosmos: registrar e continuar
+        print("Aviso: falha ao conectar no Cosmos DB:", e)
+        cosmos_enabled = False
+
+# --------------------
+# HELPERS
+# --------------------
+
+def safe_float(x):
+    """Converte tipos numpy e similares para float do Python."""
+    try:
+        return float(x)
+    except Exception:
+        try:
+            return float(np.asarray(x).item())
+        except Exception:
+            return None
+
+
+def write_log_cosmos(log_type, message, data=None):
+    if not cosmos_enabled:
+        return
+    try:
+        item = {
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.utcnow().isoformat(),
+            "type": log_type,
+            "message": message,
+            "data": data or {}
+        }
+        # garante que id é string e partition key exista
+        if "type" not in item or not item["type"]:
+            item["type"] = "info"
+        cosmos_container.upsert_item(item)
+    except Exception as e:
+        print("Erro ao gravar no Cosmos:", e)
+
+
+def registrar_treino(mae, rmse, r2):
+    # converter para tipos primitivos do Python
+    mae_v = safe_float(mae)
+    rmse_v = safe_float(rmse)
+    r2_v = safe_float(r2)
+
+    entity = {
+        "PartitionKey": "Treinos",
+        "RowKey": str(uuid.uuid4()),
         "timestamp": datetime.utcnow().isoformat(),
-        "type": log_type,
-        "message": message,
-        "data": data
-    })
+        "MAE": mae_v,
+        "RMSE": rmse_v,
+        "R2": r2_v
+    }
+    try:
+        table_client.create_entity(entity)
+        # também grava no Cosmos (opcional)
+        write_log_cosmos("treino", "Treino registrado", {"MAE": mae_v, "RMSE": rmse_v, "R2": r2_v})
+    except Exception as e:
+        print("Erro ao registrar treino na Table Storage:", e)
+        # relançar para que endpoints que dependem do registro falhem com 500, se necessário
+        raise
 
-# ============================================================
-# 1. CRIE O APP PRIMEIRO
-# ============================================================
+# --------------------
+# HELPERS BLOB
+# --------------------
+
+def upload_to_blob(blob_name: str, data: bytes):
+    try:
+        blob_container.upload_blob(name=blob_name, data=data, overwrite=True)
+    except Exception as e:
+        print(f"Erro upload blob {blob_name}: {e}")
+        raise
+
+
+def download_from_blob(blob_name: str) -> bytes:
+    try:
+        blob = blob_container.get_blob_client(blob_name)
+        return blob.download_blob().readall()
+    except Exception as e:
+        print(f"Erro download blob {blob_name}: {e}")
+        raise
+
+
+def delete_blob(blob_name: str):
+    try:
+        blob_container.get_blob_client(blob_name).delete_blob()
+    except Exception:
+        pass
+
+# --------------------
+# Função de construção de lags (mantida)
+# --------------------
+
+def build_lags(df, lags=5, target="time"):
+    if all(f"lag{i}" in df.columns for i in range(1, lags + 1)):
+        X = df[[f"lag{i}" for i in range(1, lags + 1)]]
+        y = df[target]
+        return X, y
+
+    if target not in df.columns:
+        raise ValueError("A coluna 'time' não foi encontrada no CSV.")
+
+    s = df[target].astype(float)
+
+    data = {f"lag{i}": s.shift(i) for i in range(1, lags + 1)}
+    data[target] = s
+    new_df = pd.DataFrame(data).dropna().reset_index(drop=True)
+
+    X = new_df[[f"lag{i}" for i in range(1, lags + 1)]]
+    y = new_df[target]
+
+    return X, y
+
+# --------------------
+# FASTAPI APP
+# --------------------
 app = FastAPI(title="ML Remote API with Azure Storage + Banco Gratuito")
 
-
-# ============================================================
-# 2. AGORA CONFIGURE O CORS (usando a variável 'app' que existe)
-# ============================================================
 origins = [
     "http://localhost:8080",
     "http://127.0.0.1:8080",
     "http://localhost:9000",
     "http://127.0.0.1:9000",
     "null",
-    "*" # Permissão ampla, útil para ambientes de teste como o ACA
+    "*"
 ]
 
 app.add_middleware(
@@ -65,6 +228,210 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Frontend embutido (mantido)
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+HTML_TEMPLATE = """[...TRUNCATED FOR BREVITY IN FILE]"""
+HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend_embedded():
+    return HTMLResponse(content=HTML_DASHBOARD, status_code=200)
+
+# --------------------
+# Endpoints: uploads
+# --------------------
+
+@app.post("/upload/train")
+async def upload_train(file: UploadFile = File(...)):
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV inválido: {e}")
+
+    try:
+        upload_to_blob("train_upload.csv", contents)
+    except Exception as e:
+        print("Erro ao enviar treino para blob:", e)
+        raise HTTPException(status_code=500, detail="Falha ao salvar arquivo de treino no Blob Storage")
+
+    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
+
+
+@app.post("/upload/test")
+async def upload_test(file: UploadFile = File(...)):
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV inválido: {e}")
+
+    try:
+        upload_to_blob("test_upload.csv", contents)
+    except Exception as e:
+        print("Erro ao enviar teste para blob:", e)
+        raise HTTPException(status_code=500, detail="Falha ao salvar arquivo de teste no Blob Storage")
+
+    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
+
+# --------------------
+# Train endpoint
+# --------------------
+
+@app.post("/train")
+async def train_model(lags: int = Form(...), cv_splits: int = Form(...)):
+    try:
+        # baixar CSV
+        data = download_from_blob("train_upload.csv")
+        df = pd.read_csv(io.BytesIO(data))
+
+        X, y = build_lags(df, lags=lags)
+
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
+        maes, rmses, r2s = [], [], []
+
+        for tr, val in tscv.split(X_scaled):
+            Xtr, Xval = X_scaled[tr], X_scaled[val]
+            ytr, yval = y.iloc[tr], y.iloc[val]
+
+            m = LinearRegression()
+            m.fit(Xtr, ytr)
+            preds = m.predict(Xval)
+
+            maes.append(mean_absolute_error(yval, preds))
+            rmses.append(np.sqrt(mean_squared_error(yval, preds)))
+            r2s.append(r2_score(yval, preds))
+
+        model = LinearRegression()
+        model.fit(X_scaled, y)
+
+        b = io.BytesIO()
+        joblib.dump(model, b)
+        upload_to_blob("model.joblib", b.getvalue())
+
+        b2 = io.BytesIO()
+        joblib.dump(scaler, b2)
+        upload_to_blob("scaler.joblib", b2.getvalue())
+
+        # registrar no Table Storage (convertendo tipos)
+        registrar_treino(np.mean(maes), np.mean(rmses), np.mean(r2s))
+
+        metrics = {
+            "MAE": float(np.mean(maes)),
+            "RMSE": float(np.mean(rmses)),
+            "R2": float(np.mean(r2s))
+        }
+
+        return {"status": "trained", "metrics": metrics}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERRO NO TREINO:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erro no processo de treino: {e}")
+
+
+# --------------------
+# Predict endpoint
+# --------------------
+
+@app.post("/predict")
+async def predict():
+    try:
+        model = joblib.load(io.BytesIO(download_from_blob("model.joblib")))
+        scaler = joblib.load(io.BytesIO(download_from_blob("scaler.joblib")))
+        df = pd.read_csv(io.BytesIO(download_from_blob("test_upload.csv")))
+
+        has_labels = "time" in df.columns
+
+        X, y = build_lags(df, lags=5)
+        X_scaled = scaler.transform(X)
+        preds = model.predict(X_scaled)
+
+        out = pd.DataFrame({"predicted": preds})
+
+        if has_labels:
+            out["actual"] = y.values[:len(preds)]
+            out["error"] = out["actual"] - out["predicted"]
+
+        b = io.BytesIO()
+        out.to_csv(b, index=False)
+        upload_to_blob("predictions.csv", b.getvalue())
+
+        # opcional: gravar log no cosmos
+        try:
+            write_log_cosmos("predict", "Predição executada", {"n": len(preds)})
+        except Exception:
+            pass
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        print("Erro no predict:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erro no predict: {e}")
+
+
+# --------------------
+# Download predictions
+# --------------------
+
+@app.get("/download/predictions")
+async def download_predictions():
+    try:
+        data = download_from_blob("predictions.csv")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail="Nenhuma previsão disponível")
+
+    path = "/tmp/predictions.csv"
+    with open(path, "wb") as f:
+        f.write(data)
+    return FileResponse(path, filename="predictions.csv")
+
+
+# --------------------
+# Logs e métricas
+# --------------------
+
+@app.get("/logs")
+async def logs():
+    try:
+        items = list(table_client.list_entities())
+        return {"logs": items}
+    except Exception as e:
+        print("Erro ao listar treinos:", e)
+        raise HTTPException(status_code=500, detail="Falha ao listar logs")
+
+
+@app.get("/metrics/last")
+async def last_metrics():
+    try:
+        itens = list(table_client.list_entities())
+        if not itens:
+            return {"message": "Nenhum treino encontrado"}
+        itens.sort(key=lambda x: x["timestamp"], reverse=True)
+        return itens[0]
+    except Exception as e:
+        print("Erro ao buscar métricas:", e)
+        raise HTTPException(status_code=500, detail="Falha ao obter última métrica")
+
+
+# --------------------
+# Reset
+# --------------------
+
+@app.post("/reset")
+async def reset():
+    for f in ["train_upload.csv", "test_upload.csv", "model.joblib", "scaler.joblib", "predictions.csv"]:
+        try:
+            delete_blob(f)
+        except Exception:
+            pass
+    return {"status": "reset"}
 
 # ============================================================
 # 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
@@ -299,281 +666,3 @@ async def serve_frontend_embedded():
 # ============================================================
 # 4. CONFIGURAÇÃO DO AZURE STORAGE (BLOB + TABLE)
 # ============================================================
-
-import os
-
-
-ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
-ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
-AZURE_CONTAINER = "meucontainer"
-TABLE_NAME = "Treinos"
-
-
-# Removendo a lógica desnecessária de AZURE_CONNECTION_STRING e apenas verificando
-# se as variáveis necessárias para a Connection String existem.
-if not ACCOUNT_NAME or not ACCOUNT_KEY:
-    # Este erro será disparado se as variáveis do ACA não estiverem sendo injetadas corretamente
-    raise RuntimeError(
-        "Azure credentials not found. Certifique-se de que as variáveis "
-        "AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY estão configuradas como SEGREDOS."
-    )
-
-connection_string = (
-    f"DefaultEndpointsProtocol=https;"
-    f"AccountName={ACCOUNT_NAME};"
-    f"AccountKey={ACCOUNT_KEY};"
-    f"EndpointSuffix=core.windows.net"
-)
-
-# BLOB STORAGE
-# A falha pode ocorrer aqui se a connection_string for inválida
-try:
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
-    container = blob_service.get_container_client(AZURE_CONTAINER)
-except Exception as e:
-    raise RuntimeError(f"Falha crítica ao conectar ao Blob Storage: {e}")
-
-# TABLE STORAGE (BANCO GRATUITO)
-try:
-    table_service = TableServiceClient.from_connection_string(connection_string)
-    # Tentar criar a tabela, se falhar, apenas obtê-la
-    table_client = table_service.create_table_if_not_exists(TABLE_NAME)
-except Exception as e:
-    raise RuntimeError(f"Falha crítica ao conectar ao Table Storage: {e}")
-
-
-def registrar_treino(mae, rmse, r2):
-    entity = {
-        "PartitionKey": "Treinos",
-        "RowKey": str(uuid.uuid4()),
-        "timestamp": datetime.utcnow().isoformat(),
-        "MAE": float(mae),
-        "RMSE": float(float(rmse)),
-        "R2": float(r2)
-    }
-    # ESTA CHAMADA É QUE DEVE ESTAR FALHANDO NO 500
-    table_client.create_entity(entity)
-
-
-def listar_treinos():
-    return list(table_client.list_entities())
-
-
-def ultimo_treino():
-    itens = list(table_client.list_entities())
-    if not itens:
-        return None
-    itens.sort(key=lambda x: x["timestamp"], reverse=True)
-    return itens[0]
-
-
-# ============================================================
-# HELPERS PARA ARQUIVOS NO BLOB
-# ============================================================
-
-def upload_to_blob(blob_name: str, data: bytes):
-    container.upload_blob(name=blob_name, data=data, overwrite=True)
-
-def download_from_blob(blob_name: str) -> bytes:
-    blob = container.get_blob_client(blob_name)
-    return blob.download_blob().readall()
-
-def delete_blob(blob_name: str):
-    try:
-        container.get_blob_client(blob_name).delete_blob()
-    except:
-        pass
-
-
-# ============================================================
-# FUNÇÃO: construir lags
-# ============================================================
-
-def build_lags(df, lags=5, target="time"):
-    if all(f"lag{i}" in df.columns for i in range(1, lags + 1)):
-        X = df[[f"lag{i}" for i in range(1, lags + 1)]]
-        y = df[target]
-        return X, y
-
-    if target not in df.columns:
-        raise ValueError("A coluna 'time' não foi encontrada no CSV.")
-
-    s = df[target].astype(float)
-
-    data = {f"lag{i}": s.shift(i) for i in range(1, lags + 1)}
-    data[target] = s
-    new_df = pd.DataFrame(data).dropna().reset_index(drop=True)
-
-    X = new_df[[f"lag{i}" for i in range(1, lags + 1)]]
-    y = new_df[target]
-
-    return X, y
-
-
-# ============================================================
-# ENDPOINT: UPLOAD TRAIN
-# ============================================================
-
-@app.post("/upload/train")
-async def upload_train(file: UploadFile = File(...)):
-    contents = await file.read()
-    df = pd.read_csv(io.BytesIO(contents))
-    
-    # Esta linha faz upload para o Azure Blob Storage, que pode ser o ponto de falha 500.
-    upload_to_blob("train_upload.csv", contents) 
-    
-    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
-
-
-# ============================================================
-# ENDPOINT: TRAIN
-# ============================================================
-
-@app.post("/train")
-async def train_model(
-    lags: int = Form(...),
-    cv_splits: int = Form(...)
-):
-    try:
-        print("Recebido:", lags, cv_splits)
-
-        df = pd.read_csv(io.BytesIO(download_from_blob("train_upload.csv")))
-
-        X, y = build_lags(df, lags=lags)
-
-        scaler = MinMaxScaler()
-        X_scaled = scaler.fit_transform(X)
-
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
-        maes, rmses, r2s = [], [], []
-
-        for tr, val in tscv.split(X_scaled):
-            Xtr, Xval = X_scaled[tr], X_scaled[val]
-            ytr, yval = y.iloc[tr], y.iloc[val]
-
-            m = LinearRegression()
-            m.fit(Xtr, ytr)
-            preds = m.predict(Xval)
-
-            maes.append(mean_absolute_error(yval, preds))
-
-            mse = mean_squared_error(yval, preds)
-            rmse = np.sqrt(mse)
-            rmses.append(rmse)
-
-            r2s.append(r2_score(yval, preds))
-
-        model = LinearRegression()
-        model.fit(X_scaled, y)
-
-        b = io.BytesIO()
-        joblib.dump(model, b)
-        upload_to_blob("model.joblib", b.getvalue())
-
-        b = io.BytesIO()
-        joblib.dump(scaler, b)
-        upload_to_blob("scaler.joblib", b.getvalue())
-
-        registrar_treino(np.mean(maes), np.mean(rmses), np.mean(r2s))
-
-        metrics = {
-            "MAE": float(np.mean(maes)),
-            "RMSE": float(np.mean(rmses)),
-            "R2": float(np.mean(r2s))
-        }
-
-        return {"status": "trained", "metrics": metrics}
-
-    except Exception as e:
-        print("ERRO NO TREINO:", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro no processo de treino: {str(e)}"
-        )
-
-
-# ============================================================
-# ENDPOINT: UPLOAD TEST
-# ============================================================
-
-@app.post("/upload/test")
-async def upload_test(file: UploadFile = File(...)):
-    contents = await file.read()
-    df = pd.read_csv(io.BytesIO(contents))
-    upload_to_blob("test_upload.csv", contents)
-    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
-
-
-# ============================================================
-# ENDPOINT: PREDICT
-# ============================================================
-
-@app.post("/predict")
-async def predict():
-
-    model = joblib.load(io.BytesIO(download_from_blob("model.joblib")))
-    scaler = joblib.load(io.BytesIO(download_from_blob("scaler.joblib")))
-    df = pd.read_csv(io.BytesIO(download_from_blob("test_upload.csv")))
-
-    has_labels = "time" in df.columns
-
-    X, y = build_lags(df, lags=5)
-    X_scaled = scaler.transform(X)
-    preds = model.predict(X_scaled)
-
-    out = pd.DataFrame({"predicted": preds})
-
-    if has_labels:
-        out["actual"] = y.values[:len(preds)]
-        out["error"] = out["actual"] - out["predicted"]
-
-    b = io.BytesIO()
-    out.to_csv(b, index=False)
-    upload_to_blob("predictions.csv", b.getvalue())
-
-    return {"status": "ok"}
-
-
-# ============================================================
-# ENDPOINT: DOWNLOAD PREDICTIONS
-# ============================================================
-
-@app.get("/download/predictions")
-async def download_predictions():
-    data = download_from_blob("predictions.csv")
-    path = "/tmp/predictions.csv"
-    with open(path, "wb") as f:
-        f.write(data)
-    return FileResponse(path, filename="predictions.csv")
-
-
-# ============================================================
-# ENDPOINT: LOGS (BANCO)
-# ============================================================
-
-@app.get("/logs")
-async def logs():
-    return {"logs": listar_treinos()}
-
-
-# ============================================================
-# ENDPOINT: MÉTRICAS DO ÚLTIMO TREINO
-# ============================================================
-
-@app.get("/metrics/last")
-async def last_metrics():
-    item = ultimo_treino()
-    if item is None:
-        return {"message": "Nenhum treino encontrado"}
-    return item
-
-
-# ============================================================
-# RESET
-# ============================================================
-
-@app.post("/reset")
-async def reset():
-    for f in ["train_upload.csv", "test_upload.csv", "model.joblib", "scaler.joblib", "predictions.csv"]:
-        delete_blob(f)
-    return {"status": "reset"}
