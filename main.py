@@ -328,7 +328,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="box">
-        <h3>Preview das previsões</h3>
+        <h3>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
     </div>
 
