@@ -20,6 +20,24 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
 from fastapi.middleware.cors import CORSMiddleware
+from azure.cosmos import CosmosClient
+
+# conexão com o Azure Cosmos DB para logging adicional
+cosmos_uri = os.getenv("COSMOS_URI")
+cosmos_key = os.getenv("COSMOS_KEY")
+
+client = CosmosClient(cosmos_uri, credential=cosmos_key)
+db = client.get_database_client("remote-ml")
+container = db.get_container_client("logs")
+
+def write_log(log_type, message, data=None):
+    container.create_item({
+        "id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat(),
+        "type": log_type,
+        "message": message,
+        "data": data
+    })
 
 # ============================================================
 # 1. CRIE O APP PRIMEIRO
