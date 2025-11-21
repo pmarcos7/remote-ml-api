@@ -1,20 +1,3 @@
-# ============================================================
-# main.py - API de Regressão Linear Remota com Azure Storage + Banco Gratuito
-# ============================================================
-
-# ============================================================
-# main.py - CORRIGIDO - API de Regressão Linear Remota
-# Correções importantes:
-# - Evita sobrescrever variáveis (blob_container vs cosmos_container)
-# - Verifica presence de env vars e falha com mensagens claras
-# - Trata tipos numpy antes de gravar no Azure Table
-# - Uso seguro do Cosmos DB (opcional) — só ativa se COSMOS_URI/COSMOS_KEY existirem
-# - Tratamento de erros de I/O com mensagens e logs
-# - Mantém comportamento original (upload, train, predict, download)
-# ============================================================
-
-# main.py - API de Regressão Linear Remota (corrigido, tudo em um bloco)
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, HTMLResponse
 from azure.storage.blob import BlobServiceClient
@@ -89,7 +72,7 @@ try:
     table_service = TableServiceClient.from_connection_string(connection_string)
     # Cliente para a tabela de treinos (já existente)
     table_client = table_service.create_table_if_not_exists(TABLE_NAME)
-    # NOVO: Cliente para a tabela de predições
+    # Cliente para a nova tabela de predições
     predictions_table_client = table_service.create_table_if_not_exists(PREDICTIONS_TABLE_NAME)
 except Exception as e:
     raise RuntimeError(f"Falha ao conectar ao Table Storage: {e}")
@@ -565,7 +548,7 @@ async def logs():
         raise HTTPException(status_code=500, detail="Falha ao listar logs")
 
 # --------------------
-# NOVO: Logs das Predições na Tabela Azure
+# Logs das Predições na Tabela Azure
 # --------------------
 @app.get("/predictions/table")
 async def predictions_table():
@@ -645,6 +628,8 @@ async def reset():
         except Exception:
             pass
     return {"status": "reset"}
+
+
 # ============================================================
 # 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
 # ============================================================
@@ -707,9 +692,12 @@ HTML_TEMPLATE = """
                 <button onclick="getLastMetrics()">Último treino (Table)</button>
                 <button onclick="getLogs()">Ver logs (Table)</button>
             </div>
-            <div style="display:flex;gap:8px;align-items:center">
-                <button onclick="getCosmosLogs()">Ver logs (Cosmos)</button>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <button onclick="getCosmosLogs()">Ver Treinos (Cosmos)</button>
                 <button onclick="getCosmosPredictions()">Ver Predições (Cosmos)</button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+                <button onclick="getTablePredictions()">Ver Predições (Table)</button>
             </div>
             <div id="metrics" style="margin-top:8px"></div>
         </div>
@@ -732,10 +720,8 @@ const API_BASE = "__API_URL__";
 function log(msg){
     const c = document.getElementById('console');
     // CORRIGIDO: Removido caracteres de escape desnecessários para o navegador
-    c.textContent = `${new Date().toISOString()} — ${msg}\\n` + c.textContent; 
+    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent; 
 }
-
-// O restante das suas funções JS (uploadTrain, train, etc.) usam API_BASE corretamente.
 
 async function uploadTrain(){
     const f = document.getElementById('trainFile').files[0];
@@ -825,11 +811,46 @@ async function getLogs(){
     log('Logs recebidos: ' + logsCache.length);
     const html = ['<table><thead><tr><th>RowKey</th><th>timestamp</th><th>MAE</th><th>RMSE</th><th>R2</th></tr></thead><tbody>'];
     for(const it of logsCache){
-        html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
+        html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
     }
     html.push('</tbody></table>');
-    document.getElementById('metrics').innerHTML = html.join('');
+    document.getElementById('metrics').innerHTML = '<h4>Treinos (Azure Table Storage)</h4>' + html.join('');
 }
+
+// NOVO CÓDIGO JS: Função para visualizar Predições salvas na Tabela Azure
+async function getTablePredictions(){
+    try{
+        const res = await fetch(`${API_BASE}/predictions/table`);
+        if (!res.ok) {
+            const errorText = await res.text();
+            log(`ERRO HTTP ${res.status} ao buscar predições Table: ${errorText}`);
+            document.getElementById('metrics').innerHTML = `<h4>Erro (${res.status})</h4><pre>${errorText}</pre>`;
+            return;
+        }
+
+        const j = await res.json();
+        const predictions = j.predictions_table || []; 
+
+        log(`Predições Table recebidas: ${predictions.length}`);
+        
+        if (predictions.length === 0) {
+            document.getElementById('metrics').innerHTML = '<h4>Predições (Azure Table Storage)</h4><p>Nenhuma predição encontrada.</p>';
+            return;
+        }
+
+        const html = ['<table><thead><tr><th>RowKey</th><th>PartitionKey</th><th>Predição</th><th>Lags</th></tr></thead><tbody>'];
+        for(const it of predictions){
+            const lags_summary = JSON.stringify(it.InputLags).substring(0, 50) + "...";
+            html.push(`<tr><td>${it.RowKey.substring(0,8)}...</td><td>${it.PartitionKey.substring(0,8)}...</td><td>${it.PredictedValue.toFixed(4)}</td><td>${lags_summary}</td></tr>`);
+        }
+        html.push('</tbody></table>');
+        document.getElementById('metrics').innerHTML = '<h4>Predições (Azure Table Storage)</h4>' + html.join('');
+    }catch(e){
+        log('ERRO no frontend ao buscar predições Table: ' + e.message);
+        document.getElementById('metrics').innerText = 'Erro no frontend: ' + e.message;
+    }
+}
+
 
 function exportLogsCSV(){
     if(!logsCache || logsCache.length===0){ alert('Sem logs para exportar'); return; }
@@ -839,7 +860,7 @@ function exportLogsCSV(){
         const row = cols.map(c => JSON.stringify(it[c] ?? '')).join(',');
         lines.push(row);
     }
-    const blob = new Blob([lines.join('\\n')], {type:'text/csv;charset=utf-8;'});
+    const blob = new Blob([lines.join('\n')], {type:'text/csv;charset=utf-8;'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -856,7 +877,7 @@ async function showPredictionsPreview(){
         const res = await fetch(`${API_BASE}/download/predictions`);
         if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
         const txt = await res.text();
-        const lines = txt.trim().split('\\n').slice(0, 11).join('\\n');
+        const lines = txt.trim().split('\n').slice(0, 11).join('\n');
         document.getElementById('predPreview').innerText = lines;
     }catch(e){
         log('Erro preview: ' + e);
@@ -867,9 +888,11 @@ async function getCosmosLogs(){
     try{
         const res = await fetch(`${API_BASE}/logs/cosmos`);
         const j = await res.json();
-        log('Logs Cosmos recebidos: ' + j.logs_cosmos.length);
+        log('Logs Cosmos recebidos: ' + (j.logs_cosmos ? j.logs_cosmos.length : 0));
+        const logs = j.logs_cosmos || [];
+        
         const html = ['<table><thead><tr><th>Type</th><th>ID</th><th>Timestamp</th><th>Message/Summary</th></tr></thead><tbody>'];
-        for(const it of j.logs_cosmos){
+        for(const it of logs){
             const summary = it.data_summary || it.modelParams_summary || it.message || 'N/A';
             html.push(`<tr><td>${it.type}</td><td>${it.id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${summary}</td></tr>`);
         }
@@ -885,9 +908,11 @@ async function getCosmosPredictions(){
     try{
         const res = await fetch(`${API_BASE}/predictions/cosmos`);
         const j = await res.json();
-        log('Predições Cosmos recebidas: ' + j.predictions_cosmos.length);
+        log('Predições Cosmos recebidas: ' + (j.predictions_cosmos ? j.predictions_cosmos.length : 0));
+        const predictions = j.predictions_cosmos || [];
+
         const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Input</th><th>Output</th></tr></thead><tbody>'];
-        for(const it of j.predictions_cosmos){
+        for(const it of predictions){
             const input_summary = JSON.stringify(it.input).substring(0, 30) + "...";
             html.push(`<tr><td>${it.id.substring(0,8)}...</td><td>${it.training_id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${input_summary}</td><td>${it.output}</td></tr>`);
         }
