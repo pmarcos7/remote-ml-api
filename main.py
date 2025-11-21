@@ -18,34 +18,17 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from fastapi.middleware.cors import CORSMiddleware
 
-# Cosmos (opcional)
-try:
-    from azure.cosmos import CosmosClient
-except Exception:
-    CosmosClient = None  # se não estiver instalado, continuamos sem cosmos
-
-# --------------------
-# CONFIGURAÇÕES E VARIÁVEIS
-# --------------------
+# ------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------
 AZURE_ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
 AZURE_ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
 AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "meucontainer")
 TABLE_NAME = os.getenv("TABLE_NAME", "Treinos")
-# NOVO: Nome da tabela para predições
-PREDICTIONS_TABLE_NAME = os.getenv("PREDICTIONS_TABLE_NAME", "Predicoes") 
+PREDICTIONS_TABLE_NAME = os.getenv("PREDICTIONS_TABLE_NAME", "Predicoes")
 
-# Cosmos (opcional)
-COSMOS_URI = os.getenv("COSMOS_URI")
-COSMOS_KEY = os.getenv("COSMOS_KEY")
-COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME", "remote-ml")
-COSMOS_TRAININGS_CONTAINER = os.getenv("COSMOS_TRAININGS_CONTAINER", "training_runs")
-COSMOS_PREDICTIONS_CONTAINER = os.getenv("COSMOS_PREDICTIONS_CONTAINER", "predictions")
-
-# Verificações iniciais mínimas para Blob/Table
 if not AZURE_ACCOUNT_NAME or not AZURE_ACCOUNT_KEY:
-    raise RuntimeError(
-        "Azure credentials not found. Defina AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY como secrets."
-    )
+    raise RuntimeError("Azure credentials missing.")
 
 connection_string = (
     f"DefaultEndpointsProtocol=https;"
@@ -54,156 +37,63 @@ connection_string = (
     f"EndpointSuffix=core.windows.net"
 )
 
-# --------------------
-# INICIALIZAÇÃO DOS CLIENTES AZURE
-# --------------------
+# ------------------------------------------------------
+# CLIENTES AZURE
+# ------------------------------------------------------
+blob_service = BlobServiceClient.from_connection_string(connection_string)
+blob_container = blob_service.get_container_client(AZURE_CONTAINER)
 try:
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
-    blob_container = blob_service.get_container_client(AZURE_CONTAINER)
-    # cria container se não existir (ignore erro se já existe)
-    try:
-        blob_container.create_container()
-    except Exception:
-        pass
-except Exception as e:
-    raise RuntimeError(f"Falha ao conectar ao Blob Storage: {e}")
+    blob_container.create_container()
+except:
+    pass
 
-try:
-    table_service = TableServiceClient.from_connection_string(connection_string)
-    # Cliente para a tabela de treinos (já existente)
-    table_client = table_service.create_table_if_not_exists(TABLE_NAME)
-    # Cliente para a nova tabela de predições
-    predictions_table_client = table_service.create_table_if_not_exists(PREDICTIONS_TABLE_NAME)
-except Exception as e:
-    raise RuntimeError(f"Falha ao conectar ao Table Storage: {e}")
+table_service = TableServiceClient.from_connection_string(connection_string)
+table_client = table_service.create_table_if_not_exists(TABLE_NAME)
+predictions_table_client = table_service.create_table_if_not_exists(PREDICTIONS_TABLE_NAME)
 
-# --------------------
-# INICIALIZAÇÃO DO COSMOS (opcional)
-# --------------------
-cosmos_enabled = False
-cosmos_client = None
-cosmos_db = None
-cosmos_trainings = None
-cosmos_predictions = None
-
-if COSMOS_URI and COSMOS_KEY and CosmosClient is not None:
-    try:
-        cosmos_client = CosmosClient(COSMOS_URI, credential=COSMOS_KEY)
-        cosmos_db = cosmos_client.create_database_if_not_exists(id=COSMOS_DB_NAME)
-        cosmos_trainings = cosmos_db.create_container_if_not_exists(
-            id=COSMOS_TRAININGS_CONTAINER,
-            partition_key="/id"  # partition key simples para runs
-        )
-        cosmos_predictions = cosmos_db.create_container_if_not_exists(
-            id=COSMOS_PREDICTIONS_CONTAINER,
-            partition_key="/training_id"
-        )
-        cosmos_enabled = True
-    except Exception as e:
-        # não falhar o app inteiro por causa do Cosmos, apenas logar
-        print("Aviso: não foi possível inicializar Cosmos DB:", e)
-        cosmos_enabled = False
-
-# --------------------
+# ------------------------------------------------------
 # HELPERS
-# --------------------
+# ------------------------------------------------------
 def safe_float(x):
     try:
         return float(x)
-    except Exception:
+    except:
         try:
             return float(np.asarray(x).item())
-        except Exception:
+        except:
             return None
 
-def write_log_cosmos(log_type, message, data=None):
-    if not cosmos_enabled:
-        return
-    try:
-        item = {
-            "id": str(uuid.uuid4()),
-            "timestamp": datetime.utcnow().isoformat(),
-            "type": log_type,
-            "message": message,
-            "data": data or {}
-        }
-        if "type" not in item or not item["type"]:
-            item["type"] = "info"
-        cosmos_trainings.upsert_item(item)  # uso train container para logs simples
-    except Exception as e:
-        print("Erro ao gravar log no Cosmos:", e)
-
-# NOVO: Função para registrar predição na Tabela Azure
-def registrar_predicao(training_id, input_row, predicted_value):
-    entity = {
-        "PartitionKey": training_id or "unknown", # Usamos o training_id como PartitionKey
-        "RowKey": str(uuid.uuid4()),
-        "timestamp": datetime.utcnow().isoformat(),
-        "PredictedValue": safe_float(predicted_value),
-        # Adiciona os valores de entrada (lag features) como propriedades
-        **{f"lag{k}": safe_float(v) for k, v in input_row.items() if str(k).startswith('lag')}
-    }
-    try:
-        predictions_table_client.create_entity(entity)
-    except Exception as e:
-        print("Erro ao registrar predição na Table Storage:", e)
-        pass 
-        
 def registrar_treino(mae, rmse, r2):
-    mae_v = safe_float(mae)
-    rmse_v = safe_float(rmse)
-    r2_v = safe_float(r2)
     entity = {
         "PartitionKey": "Treinos",
         "RowKey": str(uuid.uuid4()),
         "timestamp": datetime.utcnow().isoformat(),
-        "MAE": mae_v,
-        "RMSE": rmse_v,
-        "R2": r2_v
+        "MAE": safe_float(mae),
+        "RMSE": safe_float(rmse),
+        "R2": safe_float(r2)
     }
-    try:
-        table_client.create_entity(entity)
-        write_log_cosmos("treino", "Treino registrado na Table Storage", {"MAE": mae_v, "RMSE": rmse_v, "R2": r2_v})
-    except Exception as e:
-        print("Erro ao registrar treino na Table Storage:", e)
-        raise
+    table_client.create_entity(entity)
 
-# --------------------
-# HELPERS BLOB
-# --------------------
-def upload_to_blob(blob_name: str, data: bytes):
-    try:
-        blob_container.upload_blob(name=blob_name, data=data, overwrite=True)
-    except Exception as e:
-        print(f"Erro upload blob {blob_name}: {e}")
-        raise
+def registrar_predicao(training_id, input_row, predicted):
+    entity = {
+        "PartitionKey": training_id or "unknown",
+        "RowKey": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat(),
+        "PredictedValue": safe_float(predicted),
+        **{f"lag{k}": safe_float(v) for k, v in input_row.items()}
+    }
+    predictions_table_client.create_entity(entity)
 
-def download_from_blob(blob_name: str) -> bytes:
-    try:
-        blob = blob_container.get_blob_client(blob_name)
-        downloader = blob.download_blob()
-        return downloader.readall()
-    except Exception as e:
-        print(f"Erro download blob {blob_name}: {e}")
-        raise
+def upload_to_blob(name, data):
+    blob_container.upload_blob(name=name, data=data, overwrite=True)
 
-def delete_blob(blob_name: str):
-    try:
-        blob_container.get_blob_client(blob_name).delete_blob()
-    except Exception:
-        pass
+def download_from_blob(name):
+    return blob_container.get_blob_client(name).download_blob().readall()
 
-# --------------------
+# ------------------------------------------------------
 # build_lags
-# --------------------
+# ------------------------------------------------------
 def build_lags(df, lags=5, target="time"):
-    # se já tem colunas lag1..lagN, usa direto
-    if all(f"lag{i}" in df.columns for i in range(1, lags + 1)):
-        X = df[[f"lag{i}" for i in range(1, lags + 1)]]
-        y = df[target]
-        return X, y
-    if target not in df.columns:
-        raise ValueError("A coluna 'time' não foi encontrada no CSV.")
     s = df[target].astype(float)
     data = {f"lag{i}": s.shift(i) for i in range(1, lags + 1)}
     data[target] = s
@@ -212,422 +102,157 @@ def build_lags(df, lags=5, target="time"):
     y = new_df[target]
     return X, y
 
-# --------------------
-# Cosmos helpers específicos (training_runs / predictions)
-# --------------------
-def save_training_run_to_cosmos(summary, model_params, metrics, model_blob_name, scaler_blob_name=None):
-    if not cosmos_enabled:
-        return None
-    training_id = str(uuid.uuid4())
-    item = {
-        "id": training_id,
-        "timestamp": datetime.utcnow().isoformat(),
-        "inputSummary": summary,
-        "modelParams": model_params,
-        "metrics": metrics,
-        "model_blob": model_blob_name,
-        "scaler_blob": scaler_blob_name
-    }
-    try:
-        cosmos_trainings.create_item(item)
-    except Exception as e:
-        print("Erro ao salvar training_run no Cosmos:", e)
-        raise
-    return training_id
+# ------------------------------------------------------
+# FASTAPI
+# ------------------------------------------------------
+app = FastAPI(title="Remote ML API — TABLE STORAGE ONLY")
 
-def save_prediction_to_cosmos(training_id, input_row, output_value):
-    if not cosmos_enabled:
-        return None
-    pred = {
-        "id": str(uuid.uuid4()),
-        "training_id": training_id,
-        "timestamp": datetime.utcnow().isoformat(),
-        "input": input_row,
-        "output": float(output_value)
-    }
-    try:
-        cosmos_predictions.create_item(pred)
-    except Exception as e:
-        print("Erro ao salvar prediction no Cosmos:", e)
-        raise
-    return pred["id"]
-
-# --------------------
-# FASTAPI APP
-# --------------------
-app = FastAPI(title="ML Remote API with Azure Storage + Cosmos + Table Storage")
-
-origins = [
-    "http://localhost:8080",
-    "http://127.0.0.1:8080",
-    "http://localhost:9000",
-    "http://127.0.0.1:9000",
-    "null",
-    "*"
-]
+origins = ["*", "null", "http://localhost:8080"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-# pequeno HTML para teste
-API_URL = os.getenv("API_URL", "/")
-HTML_DASHBOARD = f"""
-<!doctype html><html><head><meta charset="utf-8"><title>Remote ML</title></head><body>
-<h2>Remote ML API</h2>
-<p>Endpoints: /upload/train, /train, /upload/test, /predict, /download/predictions, /logs, /metrics/last</p>
-<p>API base: {API_URL}</p>
-</body></html>
-"""
-
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend_embedded():
-    return HTMLResponse(content=HTML_DASHBOARD, status_code=200)
+async def home():
+    return "<h2>API Machine Learning Remota</h2>"
 
-# --------------------
-# Endpoints: uploads
-# --------------------
+# ------------------------------------------------------
+# UPLOADS
+# ------------------------------------------------------
 @app.post("/upload/train")
 async def upload_train(file: UploadFile = File(...)):
-    contents = await file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"CSV inválido: {e}")
-    try:
-        upload_to_blob("train_upload.csv", contents)
-    except Exception as e:
-        print("Erro ao enviar treino para blob:", e)
-        raise HTTPException(status_code=500, detail="Falha ao salvar arquivo de treino no Blob Storage")
-    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
+    data = await file.read()
+    df = pd.read_csv(io.BytesIO(data))
+    upload_to_blob("train_upload.csv", data)
+    return {"status": "ok", "rows": len(df)}
 
 @app.post("/upload/test")
 async def upload_test(file: UploadFile = File(...)):
-    contents = await file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"CSV inválido: {e}")
-    try:
-        upload_to_blob("test_upload.csv", contents)
-    except Exception as e:
-        print("Erro ao enviar teste para blob:", e)
-        raise HTTPException(status_code=500, detail="Falha ao salvar arquivo de teste no Blob Storage")
-    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
+    data = await file.read()
+    df = pd.read_csv(io.BytesIO(data))
+    upload_to_blob("test_upload.csv", data)
+    return {"status": "ok", "rows": len(df)}
 
-# --------------------
-# Train endpoint
-# --------------------
+# ------------------------------------------------------
+# TREINAR MODELO
+# ------------------------------------------------------
 @app.post("/train")
-async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
-    try:
-        data = download_from_blob("train_upload.csv")
-        df = pd.read_csv(io.BytesIO(data))
+async def train(lags: int = Form(5), cv_splits: int = Form(5)):
 
-        X, y = build_lags(df, lags=lags)
+    df = pd.read_csv(io.BytesIO(download_from_blob("train_upload.csv")))
+    X, y = build_lags(df, lags)
 
-        scaler = MinMaxScaler()
-        X_scaled = scaler.fit_transform(X)
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X)
 
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
-        maes, rmses, r2s = [], [], []
+    tscv = TimeSeriesSplit(n_splits=cv_splits)
+    maes, rmses, r2s = [], [], []
 
-        for tr, val in tscv.split(X_scaled):
-            Xtr, Xval = X_scaled[tr], X_scaled[val]
-            ytr, yval = y.iloc[tr], y.iloc[val]
-
-            m = LinearRegression()
-            m.fit(Xtr, ytr)
-            preds = m.predict(Xval)
-
-            maes.append(mean_absolute_error(yval, preds))
-            rmses.append(np.sqrt(mean_squared_error(yval, preds)))
-            r2s.append(r2_score(yval, preds))
+    for tr, val in tscv.split(X_scaled):
+        Xtr, Xval = X_scaled[tr], X_scaled[val]
+        ytr, yval = y.iloc[tr], y.iloc[val]
 
         model = LinearRegression()
-        model.fit(X_scaled, y)
+        model.fit(Xtr, ytr)
+        preds = model.predict(Xval)
 
-        # salvar model + scaler no blob com timestamp
-        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        model_blob_name = f"model_{ts}.joblib"
-        scaler_blob_name = f"scaler_{ts}.joblib"
+        maes.append(mean_absolute_error(yval, preds))
+        rmses.append(np.sqrt(mean_squared_error(yval, preds)))
+        r2s.append(r2_score(yval, preds))
 
-        b = io.BytesIO()
-        joblib.dump(model, b)
-        upload_to_blob(model_blob_name, b.getvalue())
+    model = LinearRegression()
+    model.fit(X_scaled, y)
 
-        b2 = io.BytesIO()
-        joblib.dump(scaler, b2)
-        upload_to_blob(scaler_blob_name, b2.getvalue())
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    mname = f"model_{ts}.joblib"
+    sname = f"scaler_{ts}.joblib"
 
-        # preparar resumo e params
-        summary = {
-            "rows": int(len(df)),
-            "columns": list(df.columns),
-            "target": "time",
-            "count": int(len(y)),
-            "min": float(y.min()),
-            "max": float(y.max()),
-            "mean": float(y.mean())
-        }
-        model_params = {
-            "coef": [float(c) for c in model.coef_.tolist()],
-            "intercept": float(model.intercept_)
-        }
-        metrics = {
-            "MAE": float(np.mean(maes)),
-            "RMSE": float(np.mean(rmses)),
-            "R2": float(np.mean(r2s))
-        }
+    b = io.BytesIO(); joblib.dump(model, b)
+    upload_to_blob(mname, b.getvalue())
 
-        # salvar run no cosmos (opcional)
-        training_id = None
-        try:
-            training_id = save_training_run_to_cosmos(summary, model_params, metrics, model_blob_name, scaler_blob_name)
-        except Exception as e:
-            print("Aviso: falha ao salvar training_run no Cosmos:", e)
+    b = io.BytesIO(); joblib.dump(scaler, b)
+    upload_to_blob(sname, b.getvalue())
 
-        # registrar em Table Storage (log simples)
-        try:
-            registrar_treino(metrics["MAE"], metrics["RMSE"], metrics["R2"])
-        except Exception as e:
-            print("Aviso: falha ao registrar na Table Storage:", e)
+    metrics = {
+        "MAE": float(np.mean(maes)),
+        "RMSE": float(np.mean(rmses)),
+        "R2": float(np.mean(r2s))
+    }
 
-        return {"status": "trained", "metrics": metrics, "training_id": training_id, "model_blob": model_blob_name}
+    registrar_treino(metrics["MAE"], metrics["RMSE"], metrics["R2"])
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("ERRO NO TREINO:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Erro no processo de treino: {e}")
+    return {"status": "trained", "metrics": metrics}
 
-# --------------------
-# Predict endpoint
-# --------------------
+# ------------------------------------------------------
+# PREVER
+# ------------------------------------------------------
 @app.post("/predict")
-async def predict(training_id: str = Form(None), lags: int = Form(5)):
-    try:
-        # decidir qual model/scaler usar
-        model_blob = None
-        scaler_blob = None
-        if training_id and cosmos_enabled:
-            # buscar run no cosmos
-            query = f"SELECT * FROM c WHERE c.id = '{training_id}'"
-            docs = list(cosmos_trainings.query_items(query=query, enable_cross_partition_query=True))
-            if not docs:
-                raise HTTPException(status_code=404, detail="training_id não encontrado no Cosmos")
-            doc = docs[0]
-            model_blob = doc.get("model_blob")
-            scaler_blob = doc.get("scaler_blob")
-        else:
-            # fallback: pega o mais recente pelo nome (busca blob list)
-            # tenta pegar "model_*.joblib" mais recente
-            try:
-                blobs = list(blob_container.list_blobs(name_starts_with="model_"))
-                if blobs:
-                    # escolher o mais recente por last_modified
-                    blobs_sorted = sorted(blobs, key=lambda b: b.last_modified or datetime.min, reverse=True)
-                    model_blob = blobs_sorted[0].name
-                blobs_s = list(blob_container.list_blobs(name_starts_with="scaler_"))
-                if blobs_s:
-                    blobs_s_sorted = sorted(blobs_s, key=lambda b: b.last_modified or datetime.min, reverse=True)
-                    scaler_blob = blobs_s_sorted[0].name
-            except Exception:
-                # se falhar, assume nomes padrão
-                model_blob = model_blob or "model.joblib"
-                scaler_blob = scaler_blob or "scaler.joblib"
+async def predict(training_id: str = Form("default"), lags: int = Form(5)):
 
-        if not model_blob:
-            raise HTTPException(status_code=404, detail="Modelo não encontrado no Blob Storage")
+    # encontra modelo mais recente
+    blobs = list(blob_container.list_blobs(name_starts_with="model_"))
+    blobs_sorted = sorted(blobs, key=lambda b: b.last_modified, reverse=True)
+    mname = blobs_sorted[0].name
 
-        model = joblib.load(io.BytesIO(download_from_blob(model_blob)))
-        scaler = joblib.load(io.BytesIO(download_from_blob(scaler_blob))) if scaler_blob else None
+    sblobs = list(blob_container.list_blobs(name_starts_with="scaler_"))
+    s_sorted = sorted(sblobs, key=lambda b: b.last_modified, reverse=True)
+    sname = s_sorted[0].name
 
-        # ler test csv do blob
-        data = download_from_blob("test_upload.csv")
-        df = pd.read_csv(io.BytesIO(data))
+    model = joblib.load(io.BytesIO(download_from_blob(mname)))
+    scaler = joblib.load(io.BytesIO(download_from_blob(sname)))
 
-        has_labels = "time" in df.columns
-        X, y = build_lags(df, lags=lags)
+    df = pd.read_csv(io.BytesIO(download_from_blob("test_upload.csv")))
+    X, y = build_lags(df, lags)
+    X_scaled = scaler.transform(X)
 
-        X_scaled = scaler.transform(X) if scaler is not None else X
-        preds = model.predict(X_scaled)
+    preds = model.predict(X_scaled)
 
-        out = pd.DataFrame({"predicted": preds})
-        if has_labels:
-            out["actual"] = y.values[:len(preds)]
-            out["error"] = out["actual"] - out["predicted"]
+    out = pd.DataFrame({"predicted": preds})
+    if "time" in df.columns:
+        out["actual"] = y.values
+        out["error"] = out["actual"] - out["predicted"]
 
-        # salvar CSV de previsões
-        b = io.BytesIO()
-        out.to_csv(b, index=False)
-        upload_to_blob("predictions.csv", b.getvalue())
+    # salva CSV
+    b = io.BytesIO()
+    out.to_csv(b, index=False)
+    upload_to_blob("predictions.csv", b.getvalue())
 
-        # salvar cada predição no Cosmos E na nova Tabela Azure
-        saved = []
-        training_run_id = training_id or "unknown" 
+    # registra predições na tabela
+    for i, row in out.iterrows():
+        registrar_predicao(training_id, X.iloc[i].to_dict(), float(row["predicted"]))
 
-        for i, row in out.iterrows():
-            input_row = X.iloc[i].to_dict()
-            
-            # 1. Salvar no Azure Table Storage (nova tabela 'Predicoes')
-            try:
-                registrar_predicao(training_run_id, input_row, float(row["predicted"]))
-            except Exception as e:
-                print(f"Aviso: falha ao salvar prediction na Table Storage: {e}")
-                
-            # 2. Salvar no Cosmos (código existente)
-            if cosmos_enabled:
-                try:
-                    pid = save_prediction_to_cosmos(training_run_id, input_row, float(row["predicted"]))
-                    saved.append(pid)
-                except Exception as e:
-                    print("Aviso: falha ao salvar prediction no Cosmos:", e)
+    return {"status": "ok", "n": len(preds)}
 
-        # opcional: gravar log no cosmos
-        write_log_cosmos("predict", "Predição executada", {"n": len(preds), "training_id": training_id})
-
-        return {"status": "ok", "n": len(preds), "saved_ids": saved}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("Erro no predict:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Erro no predict: {e}")
-
-# --------------------
-# Download predictions
-# --------------------
+# ------------------------------------------------------
+# DOWNLOAD CSV
+# ------------------------------------------------------
 @app.get("/download/predictions")
 async def download_predictions():
-    try:
-        data = download_from_blob("predictions.csv")
-    except Exception:
-        raise HTTPException(status_code=404, detail="Nenhuma previsão disponível")
-    path = "/tmp/predictions.csv"
-    with open(path, "wb") as f:
+    data = download_from_blob("predictions.csv")
+    temp = "/tmp/predictions.csv"
+    with open(temp, "wb") as f:
         f.write(data)
-    return FileResponse(path, filename="predictions.csv")
-# --------------------
-# Predições salvas no Cosmos
-# --------------------
-@app.get("/predictions/cosmos")
-async def predictions_cosmos(training_id: str = None):
-    if not cosmos_enabled:
-        raise HTTPException(status_code=400, detail="Cosmos DB não está habilitado (faltam credenciais)")
-    try:
-        if training_id:
-            # Consulta as últimas 50 predições para um training_id específico
-            query = f"SELECT TOP 50 * FROM c WHERE c.training_id = '{training_id}' ORDER BY c.timestamp DESC"
-        else:
-            # Consulta as últimas 50 predições de forma geral (pode ser lento se não usar partição)
-            query = "SELECT TOP 50 * FROM c ORDER BY c.timestamp DESC"
-            
-        items = list(cosmos_predictions.query_items(query=query, enable_cross_partition_query=True))
-        
-        return {"predictions_cosmos": items}
-    except Exception as e:
-        print("Erro ao listar predições do Cosmos:", e)
-        raise HTTPException(status_code=500, detail=f"Falha ao listar predições do Cosmos: {e}")
-# --------------------
-# Logs e métricas
-# --------------------
+    return FileResponse(temp, filename="predictions.csv")
+
+# ------------------------------------------------------
+# LISTAR LOGS DE TREINOS (TABLE)
+# ------------------------------------------------------
 @app.get("/logs")
 async def logs():
-    try:
-        items = list(table_client.list_entities())
-        return {"logs": items}
-    except Exception as e:
-        print("Erro ao listar treinos:", e)
-        raise HTTPException(status_code=500, detail="Falha ao listar logs")
+    return {"logs": list(table_client.list_entities())}
 
-# --------------------
-# Logs das Predições na Tabela Azure
-# --------------------
+# ------------------------------------------------------
+# LISTAR PREDIÇÕES (TABLE)
+# ------------------------------------------------------
 @app.get("/predictions/table")
-async def predictions_table():
-    try:
-        # Lista as últimas 50 entidades da tabela Predicoes
-        items = list(predictions_table_client.list_entities(results_per_page=50))
-        
-        # O Table Storage não permite ordenação, mas list_entities() geralmente retorna por RowKey
-        # Vamos reformatar para facilitar a leitura
-        predictions_list = []
-        for item in items:
-            pred = {
-                "RowKey": item.RowKey,
-                "PartitionKey": item.PartitionKey,
-                "timestamp": item.timestamp.isoformat(),
-                "PredictedValue": item.PredictedValue,
-                "InputLags": {k: v for k, v in item.items() if str(k).startswith('lag')}
-            }
-            predictions_list.append(pred)
+async def predicoes_table():
+    return {"predicoes": list(predictions_table_client.list_entities())}
 
-        # Ordenar por timestamp (o table_client não garante a ordem)
-        predictions_list.sort(key=lambda x: x["timestamp"], reverse=True)
-        
-        return {"predictions_table": predictions_list}
-    except Exception as e:
-        print("Erro ao listar predições da Table Storage:", e)
-        raise HTTPException(status_code=500, detail=f"Falha ao listar predições da Table Storage: {e}")
-
-# --------------------
-# Logs e métricas - Cosmos
-# --------------------
-@app.get("/logs/cosmos")
-async def logs_cosmos():
-    if not cosmos_enabled:
-        raise HTTPException(status_code=400, detail="Cosmos DB não está habilitado (faltam credenciais)")
-    try:
-        # Consulta para os últimos 50 logs de treino, ordenados pelo mais recente
-        query = "SELECT TOP 50 * FROM c ORDER BY c.timestamp DESC"
-        # Usamos o container de trainings pois ele armazena os logs simples e os summaries dos treinos
-        items = list(cosmos_trainings.query_items(query=query, enable_cross_partition_query=True))
-        
-        # Limita o tamanho dos campos de dados para visualização
-        for item in items:
-            if "data" in item and isinstance(item["data"], dict):
-                item["data_summary"] = str(item["data"])[:50] + "..." if len(str(item["data"])) > 50 else str(item["data"])
-                del item["data"]
-            if "modelParams" in item:
-                item["modelParams_summary"] = str(item["modelParams"])[:50] + "..." if len(str(item["modelParams"])) > 50 else str(item["modelParams"])
-                del item["modelParams"]
-        
-        return {"logs_cosmos": items}
-    except Exception as e:
-        print("Erro ao listar logs do Cosmos:", e)
-        raise HTTPException(status_code=500, detail=f"Falha ao listar logs do Cosmos: {e}")
-
-
-@app.get("/metrics/last")
-async def last_metrics():
-    try:
-        itens = list(table_client.list_entities())
-        if not itens:
-            return {"message": "Nenhum treino encontrado"}
-        itens.sort(key=lambda x: x["timestamp"], reverse=True)
-        return itens[0]
-    except Exception as e:
-        print("Erro ao buscar métricas:", e)
-        raise HTTPException(status_code=500, detail="Falha ao obter última métrica")
-
-# --------------------
-# Reset
-# --------------------
-@app.post("/reset")
-async def reset():
-    for f in ["train_upload.csv", "test_upload.csv", "model.joblib", "scaler.joblib", "predictions.csv"]:
-        try:
-            delete_blob(f)
-        except Exception:
-            pass
-    return {"status": "reset"}
 
 
 # ============================================================
@@ -663,6 +288,7 @@ HTML_TEMPLATE = """
     <h1>ML Remote — Dashboard</h1>
 
     <div class="box row">
+        <!-- UPLOAD E TREINO -->
         <div class="col">
             <h3>1) Upload e Treino</h3>
             <label>Arquivo de treino (.csv)</label>
@@ -674,6 +300,7 @@ HTML_TEMPLATE = """
             <div id="trainResult" style="margin-top:8px"></div>
         </div>
 
+        <!-- UPLOAD E PREDIÇÃO -->
         <div class="col">
             <h3>2) Upload teste e Previsão</h3>
             <label>Arquivo de teste (.csv)</label>
@@ -686,18 +313,15 @@ HTML_TEMPLATE = """
             <div id="predictResult" style="margin-top:8px"></div>
         </div>
 
+        <!-- LOGS E MÉTRICAS -->
         <div class="col">
             <h3>3) Logs e Métricas</h3>
             <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
                 <button onclick="getLastMetrics()">Último treino (Table)</button>
-                <button onclick="getLogs()">Ver logs (Table)</button>
+                <button onclick="getLogs()">Logs Treino (Table)</button>
             </div>
             <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
-                <button onclick="getCosmosLogs()">Ver Treinos (Cosmos)</button>
-                <button onclick="getCosmosPredictions()">Ver Predições (Cosmos)</button>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center">
-                <button onclick="getTablePredictions()">Ver Predições (Table)</button>
+                <button onclick="getTablePredictions()">Predições (Table)</button>
             </div>
             <div id="metrics" style="margin-top:8px"></div>
         </div>
@@ -714,13 +338,11 @@ HTML_TEMPLATE = """
     </div>
 
 <script>
-// CORREÇÃO AQUI: A URL da API é injetada via Python antes de ser servida
-const API_BASE = "__API_URL__"; 
+const API_BASE = "__API_URL__";
 
 function log(msg){
     const c = document.getElementById('console');
-    // CORRIGIDO: Removido caracteres de escape desnecessários para o navegador
-    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent; 
+    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
 }
 
 async function uploadTrain(){
@@ -740,25 +362,18 @@ async function train() {
     try {
         const res = await fetch(`${API_BASE}/train`, {
             method: 'POST',
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: new URLSearchParams({ lags: 5, cv_splits: 5 })
         });
-
-        const text = await res.text();  // <-- pega qualquer coisa, até HTML
+        const text = await res.text();
         log('Resposta bruta: ' + text);
-
         const j = JSON.parse(text);
-        log('Treino finalizado: ' + JSON.stringify(j));
         document.getElementById('trainResult').innerText = JSON.stringify(j);
         getLastMetrics();
-    }
-    catch (e) {
+    } catch (e) {
         log("ERRO no front: " + e);
     }
 }
-
 
 async function uploadTest(){
     const f = document.getElementById('testFile').files[0];
@@ -804,72 +419,53 @@ async function getLastMetrics(){
 }
 
 let logsCache = [];
+
 async function getLogs(){
     const res = await fetch(`${API_BASE}/logs`);
     const j = await res.json();
     logsCache = j.logs || [];
-    log('Logs recebidos: ' + logsCache.length);
+
     const html = ['<table><thead><tr><th>RowKey</th><th>timestamp</th><th>MAE</th><th>RMSE</th><th>R2</th></tr></thead><tbody>'];
+
     for(const it of logsCache){
-        html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
+        html.push(`<tr>
+            <td>${it.RowKey}</td>
+            <td>${it.timestamp}</td>
+            <td>${it.MAE}</td>
+            <td>${it.RMSE}</td>
+            <td>${it.R2}</td>
+        </tr>`);
     }
+
     html.push('</tbody></table>');
     document.getElementById('metrics').innerHTML = '<h4>Treinos (Azure Table Storage)</h4>' + html.join('');
 }
 
-// NOVO CÓDIGO JS: Função para visualizar Predições salvas na Tabela Azure
 async function getTablePredictions(){
     try{
         const res = await fetch(`${API_BASE}/predictions/table`);
-        if (!res.ok) {
-            const errorText = await res.text();
-            log(`ERRO HTTP ${res.status} ao buscar predições Table: ${errorText}`);
-            document.getElementById('metrics').innerHTML = `<h4>Erro (${res.status})</h4><pre>${errorText}</pre>`;
-            return;
-        }
-
         const j = await res.json();
-        const predictions = j.predictions_table || []; 
+        const predictions = j.predictions_table || [];
 
-        log(`Predições Table recebidas: ${predictions.length}`);
-        
         if (predictions.length === 0) {
             document.getElementById('metrics').innerHTML = '<h4>Predições (Azure Table Storage)</h4><p>Nenhuma predição encontrada.</p>';
             return;
         }
 
-        const html = ['<table><thead><tr><th>RowKey</th><th>PartitionKey</th><th>Predição</th><th>Lags</th></tr></thead><tbody>'];
+        const html = ['<table><thead><tr><th>RowKey</th><th>Valor Previsto</th></tr></thead><tbody>'];
+
         for(const it of predictions){
-            const lags_summary = JSON.stringify(it.InputLags).substring(0, 50) + "...";
-            html.push(`<tr><td>${it.RowKey.substring(0,8)}...</td><td>${it.PartitionKey.substring(0,8)}...</td><td>${it.PredictedValue.toFixed(4)}</td><td>${lags_summary}</td></tr>`);
+            html.push(`<tr>
+                <td>${it.RowKey}</td>
+                <td>${it.PredictedValue}</td>
+            </tr>`);
         }
+
         html.push('</tbody></table>');
         document.getElementById('metrics').innerHTML = '<h4>Predições (Azure Table Storage)</h4>' + html.join('');
     }catch(e){
-        log('ERRO no frontend ao buscar predições Table: ' + e.message);
-        document.getElementById('metrics').innerText = 'Erro no frontend: ' + e.message;
+        log('Erro ao buscar predições Table: ' + e.message);
     }
-}
-
-
-function exportLogsCSV(){
-    if(!logsCache || logsCache.length===0){ alert('Sem logs para exportar'); return; }
-    const cols = ['RowKey','timestamp','MAE','RMSE','R2'];
-    const lines = [cols.join(',')];
-    for(const it of logsCache){
-        const row = cols.map(c => JSON.stringify(it[c] ?? '')).join(',');
-        lines.push(row);
-    }
-    const blob = new Blob([lines.join('\n')], {type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'logs_treinos.csv';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    log('Logs exportados (CSV).');
 }
 
 async function showPredictionsPreview(){
@@ -883,48 +479,6 @@ async function showPredictionsPreview(){
         log('Erro preview: ' + e);
     }
 }
-
-async function getCosmosLogs(){
-    try{
-        const res = await fetch(`${API_BASE}/logs/cosmos`);
-        const j = await res.json();
-        log('Logs Cosmos recebidos: ' + (j.logs_cosmos ? j.logs_cosmos.length : 0));
-        const logs = j.logs_cosmos || [];
-        
-        const html = ['<table><thead><tr><th>Type</th><th>ID</th><th>Timestamp</th><th>Message/Summary</th></tr></thead><tbody>'];
-        for(const it of logs){
-            const summary = it.data_summary || it.modelParams_summary || it.message || 'N/A';
-            html.push(`<tr><td>${it.type}</td><td>${it.id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${summary}</td></tr>`);
-        }
-        html.push('</tbody></table>');
-        document.getElementById('metrics').innerHTML = '<h4>Logs Cosmos DB (Training Runs)</h4>' + html.join('');
-    }catch(e){
-        log('Erro ao buscar logs Cosmos: ' + e);
-        document.getElementById('metrics').innerText = 'Erro ao buscar logs Cosmos: ' + e.message;
-    }
-}
-
-async function getCosmosPredictions(){
-    try{
-        const res = await fetch(`${API_BASE}/predictions/cosmos`);
-        const j = await res.json();
-        log('Predições Cosmos recebidas: ' + (j.predictions_cosmos ? j.predictions_cosmos.length : 0));
-        const predictions = j.predictions_cosmos || [];
-
-        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Input</th><th>Output</th></tr></thead><tbody>'];
-        for(const it of predictions){
-            const input_summary = JSON.stringify(it.input).substring(0, 30) + "...";
-            html.push(`<tr><td>${it.id.substring(0,8)}...</td><td>${it.training_id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${input_summary}</td><td>${it.output}</td></tr>`);
-        }
-        html.push('</tbody></table>');
-        document.getElementById('metrics').innerHTML = '<h4>Predições Cosmos DB</h4>' + html.join('');
-    }catch(e){
-        log('Erro ao buscar predições Cosmos: ' + e);
-        document.getElementById('metrics').innerText = 'Erro ao buscar predições Cosmos: ' + e.message;
-    }
-}
-
-
 
 log('Frontend pronto. API base: ' + API_BASE);
 </script>
