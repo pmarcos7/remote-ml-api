@@ -325,12 +325,11 @@ HTML_TEMPLATE = """
                 <button onclick="getLogs()">Ver logs (Table)</button>
             </div>
             <div style="display:flex;gap:8px;align-items:center">
-                <button onclick="getCosmosLogs()">Ver logs (Cosmos)</button>
-                <button onclick="getCosmosPredictions()">Ver Predições (Cosmos)</button>
+                <button onclick="getPredictionsTable()">Ver predições (Table)</button>
             </div>
             <div id="metrics" style="margin-top:8px"></div>
         </div>
-    </div>
+
 
     <div class="box">
         <h3>Preview das previsões</h3>
@@ -498,21 +497,24 @@ async function getCosmosLogs(){
     }
 }
 
-async function getCosmosPredictions(){
+// Substitui getCosmosPredictions
+async function getPredictionsTable(){
     try{
-        const res = await fetch(`${API_BASE}/predictions/cosmos`);
+        const res = await fetch(`${API_BASE}/predictions/table`);
         const j = await res.json();
-        log('Predições Cosmos recebidas: ' + j.predictions_cosmos.length);
-        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Input</th><th>Output</th></tr></thead><tbody>'];
-        for(const it of j.predictions_cosmos){
-            const input_summary = JSON.stringify(it.input).substring(0, 30) + "...";
-            html.push(`<tr><td>${it.id.substring(0,8)}...</td><td>${it.training_id.substring(0,8)}...</td><td>${it.timestamp}</td><td>${input_summary}</td><td>${it.output}</td></tr>`);
+        const preds = j.predictions_table || [];
+        log('Predições Table recebidas: ' + preds.length);
+
+        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Predicted</th><th>Lags</th></tr></thead><tbody>'];
+        for(const it of preds){
+            const lags = Object.entries(it.InputLags || {}).map(([k,v]) => `${k}:${v}`).join(', ');
+            html.push(`<tr><td>${it.RowKey}</td><td>${it.PartitionKey}</td><td>${it.timestamp}</td><td>${it.PredictedValue}</td><td>${lags}</td></tr>`);
         }
         html.push('</tbody></table>');
-        document.getElementById('metrics').innerHTML = '<h4>Predições Cosmos DB</h4>' + html.join('');
+        document.getElementById('metrics').innerHTML = '<h4>Predições Table Storage</h4>' + html.join('');
     }catch(e){
-        log('Erro ao buscar predições Cosmos: ' + e);
-        document.getElementById('metrics').innerText = 'Erro ao buscar predições Cosmos: ' + e.message;
+        log('Erro ao buscar predições Table: ' + e);
+        document.getElementById('metrics').innerText = 'Erro ao buscar predições Table: ' + e.message;
     }
 }
 
