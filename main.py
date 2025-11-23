@@ -314,6 +314,7 @@ HTML_TEMPLATE = """
         .col{flex:1;min-width:240px}
         pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <h1>ML Remote — Dashboard</h1>
@@ -358,6 +359,11 @@ HTML_TEMPLATE = """
     <div class="box">
         <h3>Preview das previsões</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
+    </div>
+
+    <div class="box">
+        <h3>Gráfico - Previsões vs Valor Real</h3>
+        <canvas id="predictionChart" height="120"></canvas>
     </div>
 
     <div class="box">
@@ -433,6 +439,7 @@ async function predict(){
     log('Predict: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
     await showPredictionsPreview();
+    await renderPredictionChart(); // nova chamada para desenhar o gráfico
 }
 
 async function downloadPredictions(){
@@ -581,9 +588,114 @@ async function getPredictionsTable(){
     }
 }
 
+async function getPredictionsTable(){
+    try{
+        const res = await fetch(`${API_BASE}/predictions/table`);
+        const j = await res.json();
+        const preds = j.predictions_table || [];
+        log('Predições Table recebidas: ' + preds.length);
 
+        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Predicted</th><th>Lags</th></tr></thead><tbody>'];
+        for(const it of preds){
+            const lags = Object.entries(it.InputLags || {}).map(([k,v]) => `${k}:${v}`).join(', ');
+            html.push(`<tr><td>${it.RowKey}</td><td>${it.PartitionKey}</td><td>${it.timestamp}</td><td>${it.PredictedValue}</td><td>${lags}</td></tr>`);
+        }
+        html.push('</tbody></table>');
+        document.getElementById('metrics').innerHTML = '<h4>Predições Table Storage</h4>' + html.join('');
+    }catch(e){
+        log('Erro ao buscar predições Table: ' + e);
+        document.getElementById('metrics').innerText = 'Erro ao buscar predições Table: ' + e.message;
+    }
+}
+
+let predictionChartInstance = null;
+
+async function renderPredictionChart(){
+    try{
+        const res = await fetch(`${API_BASE}/download/predictions`);
+        if(!res.ok){
+            log('Sem CSV de previsões para gráfico.');
+            return;
+        }
+
+        const csv = await res.text();
+        const lines = csv.trim().split('\\n');
+        if(lines.length < 2){
+            log('CSV insuficiente para plotagem.');
+            return;
+        }
+
+        const headers = lines[0].split(',');
+        const predictedIndex = headers.indexOf('predicted');
+        const actualIndex = headers.indexOf('actual');
+
+        const labels = [];
+        const predictedData = [];
+        const actualData = [];
+
+        lines.slice(1).forEach((line, i) => {
+            const cols = line.split(',');
+            labels.push(i + 1);
+            if (predictedIndex >= 0) {
+                predictedData.push(parseFloat(cols[predictedIndex]));
+            }
+            if (actualIndex >= 0) {
+                actualData.push(parseFloat(cols[actualIndex]));
+            }
+        });
+
+        const canvas = document.getElementById('predictionChart');
+        if (!canvas){
+            log('Canvas de gráfico não encontrado no HTML.');
+            return;
+        }
+        const ctx = canvas.getContext('2d');
+
+        if (predictionChartInstance) {
+            predictionChartInstance.destroy();
+        }
+
+        predictionChartInstance = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Valor Previsto',
+                        data: predictedData,
+                        borderColor: '#2563eb',
+                        backgroundColor: 'rgba(37,99,235,0.15)',
+                        tension: 0.3
+                    },
+                    {
+                        label: 'Valor Real',
+                        data: actualData,
+                        borderColor: '#16a34a',
+                        backgroundColor: 'rgba(22,163,74,0.15)',
+                        tension: 0.3
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { display: true }
+                },
+                scales: {
+                    x: { title: { display: true, text: 'Registro' } },
+                    y: { title: { display: true, text: 'Valor' } }
+                }
+            }
+        });
+
+        log('Gráfico de previsões renderizado.');
+    }catch(e){
+        log('Erro ao gerar gráfico: ' + e);
+    }
+}
 
 log('Frontend pronto. API base: ' + API_BASE);
+
 </script>
 </body>
 </html>
