@@ -7,3 +7,4 @@ python-multipart
 azure-storage-blob
 azure-data-tables
 azure-cosmos
+cryptography
