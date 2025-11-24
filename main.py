@@ -271,16 +271,16 @@ async def predictions_table():
 # 5. CRIPTOGRAFIA (ATUALIZADO: controle por metadata e flag ENCRYPT_ALL)
 # --------------------
 
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+ENCRYPTION_KEY = os.getenv("encrypt-secret-key")
 ENCRYPT_ALL = os.getenv("ENCRYPT_ALL", "false").lower() in ("1", "true", "yes")
 
 if not ENCRYPTION_KEY:
-    raise RuntimeError("Defina ENCRYPTION_KEY como secret para criptografia.")
+    raise RuntimeError("Defina encrypt-secret-key como secret para criptografia.")
 
 try:
     fernet = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
 except Exception as e:
-    raise RuntimeError(f"ENCRYPTION_KEY inválida para Fernet: {e}")
+    raise RuntimeError(f"encrypt-secret-key inválida para Fernet: {e}")
 
 def _is_blob_marked_encrypted(blob_client):
     """Retorna True se metadata 'encrypted' for 'true'."""
