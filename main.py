@@ -603,24 +603,15 @@ async function getCryptoStats(){
 
 async function showPredictionsPreview(){
     try{
-        // usa a rota de download descriptografado
-        const res = await fetch(`${API_BASE}/download/decrypted/predictions.csv`);
-        if(!res.ok){ 
-            log('Nenhuma previsão disponível.'); 
-            document.getElementById('predPreview').innerText = 'Nenhuma previsão disponível.';
-            return; 
-        }
+        const res = await fetch(`${API_BASE}/download/predictions`);
+        if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
         const txt = await res.text();
-        const lines = txt.trim().split('\n');
-        // mostra apenas as 10 primeiras linhas (cabeçalho + 9 valores)
-        const preview = lines.slice(0, 10).join('\n');
-        document.getElementById('predPreview').innerText = preview;
+        const lines = txt.trim().split('\\n').slice(0, 11).join('\\n');
+        document.getElementById('predPreview').innerText = lines;
     }catch(e){
         log('Erro preview: ' + e);
-        document.getElementById('predPreview').innerText = 'Erro ao carregar preview.';
     }
 }
-
 
 async function getLogs(){
     const res = await fetch(`${API_BASE}/logs`);
