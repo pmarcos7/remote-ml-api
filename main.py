@@ -365,6 +365,7 @@ HTML_TEMPLATE = """
         .col{flex:1;min-width:240px}
         pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <h1>ML Remote — Dashboard</h1>
@@ -379,10 +380,6 @@ HTML_TEMPLATE = """
                 <button onclick="train()">Treinar</button>
             </div>
             <div id="trainResult" style="margin-top:8px"></div>
-
-            <!-- 🔵 ADIÇÃO PARA EXIBIR CRIPTOGRAFIA -->
-            <h4>Criptografia (Treino)</h4>
-            <pre id="trainEncryption">Nenhum dado criptografado ainda.</pre>
         </div>
 
         <div class="col">
@@ -395,10 +392,6 @@ HTML_TEMPLATE = """
                 <button onclick="downloadPredictions()">Baixar Previsões</button>
             </div>
             <div id="predictResult" style="margin-top:8px"></div>
-
-            <!-- 🔵 ADIÇÃO PARA EXIBIR CRIPTOGRAFIA DO TESTE -->
-            <h4>Criptografia (Teste)</h4>
-            <pre id="testEncryption">Nenhum dado criptografado ainda.</pre>
         </div>
 
         <div class="col">
@@ -412,11 +405,21 @@ HTML_TEMPLATE = """
             </div>
             <div id="metrics" style="margin-top:8px"></div>
         </div>
-
+    </div>
+    <div class="box">
+        <h3>Criptografia</h3>
+        <button onclick="getCryptoInfo()">Ver detalhes da criptografia</button>
+        <pre id="cryptoInfo">Nenhuma informação carregada ainda.</pre>
+    </div>
 
     <div class="box">
         <h3>Preview das previsões</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
+    </div>
+
+    <div class="box">
+        <h3>Gráfico - Previsões vs Valor Real</h3>
+        <canvas id="predictionChart" height="120"></canvas>
     </div>
 
     <div class="box">
@@ -425,11 +428,11 @@ HTML_TEMPLATE = """
     </div>
 
 <script>
-const API_BASE = "__API_URL__"; 
+const API_BASE = "__API_URL__";
 
 function log(msg){
     const c = document.getElementById('console');
-    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent; 
+    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
 }
 
 async function uploadTrain(){
@@ -440,13 +443,44 @@ async function uploadTrain(){
     log('Enviando treino...');
     const res = await fetch(`${API_BASE}/upload/train`, { method:'POST', body: fd });
     const j = await res.json();
-
     log('Upload train: ' + JSON.stringify(j));
     document.getElementById('trainResult').innerText = JSON.stringify(j);
+}
+<script>
 
-    // 🔵 MOSTRAR CRIPTOGRAFIA DO BACKEND
-    if(j.encrypted_preview){
-        document.getElementById("trainEncryption").textContent = j.encrypted_preview;
+async function getCryptoInfo(){
+    try{
+        const res = await fetch(`${API_BASE}/crypto/info`);
+        const j = await res.json();
+        document.getElementById("cryptoInfo").innerText = JSON.stringify(j, null, 2);
+        log("Criptografia carregada.");
+    }catch(e){
+        log("Erro ao carregar criptografia: " + e);
+    }
+}
+</script>
+
+async function train() {
+    log('Iniciando treino...');
+    try {
+        const res = await fetch(`${API_BASE}/train`, {
+            method: 'POST',
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: new URLSearchParams({ lags: 5, cv_splits: 5 })
+        });
+
+        const text = await res.text();
+        log('Resposta bruta: ' + text);
+
+        const j = JSON.parse(text);
+        log('Treino finalizado: ' + JSON.stringify(j));
+        document.getElementById('trainResult').innerText = JSON.stringify(j);
+        getLastMetrics();
+    }
+    catch (e) {
+        log("ERRO no front: " + e);
     }
 }
 
@@ -458,16 +492,202 @@ async function uploadTest(){
     log('Enviando teste...');
     const res = await fetch(`${API_BASE}/upload/test`, { method:'POST', body: fd });
     const j = await res.json();
-
     log('Upload test: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
+}
 
-    // 🔵 MOSTRAR CRIPTOGRAFIA DO TESTE
-    if(j.encrypted_preview){
-        document.getElementById("testEncryption").textContent = j.encrypted_preview;
+async function predict(){
+    log('Rodando predict...');
+    const res = await fetch(`${API_BASE}/predict`, { method:'POST' });
+    const j = await res.json();
+    log('Predict: ' + JSON.stringify(j));
+    document.getElementById('predictResult').innerText = JSON.stringify(j);
+    await showPredictionsPreview();
+    await renderPredictionChart();
+}
+
+async function downloadPredictions(){
+    const url = `${API_BASE}/download/predictions`;
+    log('Baixando ' + url);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'predictions.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+async function getLastMetrics(){
+    try{
+        const res = await fetch(`${API_BASE}/metrics/last`);
+        const j = await res.json();
+        log('Último treino: ' + JSON.stringify(j));
+        document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
+    }catch(e){
+        log('Erro ao buscar último treino: ' + e);
     }
 }
 
+let logsCache = [];
+async function getLogs(){
+    const res = await fetch(`${API_BASE}/logs`);
+    const j = await res.json();
+    logsCache = j.logs || [];
+    log('Logs recebidos: ' + logsCache.length);
+    const html = ['<table><thead><tr><th>RowKey</th><th>timestamp</th><th>MAE</th><th>RMSE</th><th>R2</th></tr></thead><tbody>'];
+    for(const it of logsCache){
+        html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
+    }
+    html.push('</tbody></table>');
+    document.getElementById('metrics').innerHTML = html.join('');
+}
+
+function exportLogsCSV(){
+    if(!logsCache || logsCache.length===0){ alert('Sem logs para exportar'); return; }
+    const cols = ['RowKey','timestamp','MAE','RMSE','R2'];
+    const lines = [cols.join(',')];
+    for(const it of logsCache){
+        const row = cols.map(c => JSON.stringify(it[c] ?? '')).join(',');
+        lines.push(row);
+    }
+    const blob = new Blob([lines.join('\\n')], {type:'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'logs_treinos.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    log('Logs exportados (CSV).');
+}
+
+async function showPredictionsPreview(){
+    try{
+        const res = await fetch(`${API_BASE}/download/predictions`);
+        if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
+        const txt = await res.text();
+        const lines = txt.trim().split('\\n').slice(0, 11).join('\\n');
+        document.getElementById('predPreview').innerText = lines;
+    }catch(e){
+        log('Erro preview: ' + e);
+    }
+}
+
+async function getPredictionsTable(){
+    try{
+        const res = await fetch(`${API_BASE}/predictions/table`);
+        const j = await res.json();
+        const preds = j.predictions_table || [];
+        log('Predições Table recebidas: ' + preds.length);
+
+        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Predicted</th><th>Lags</th></tr></thead><tbody>'];
+        for(const it of preds){
+            const lags = Object.entries(it.InputLags || {}).map(([k,v]) => `${k}:${v}`).join(', ');
+            html.push(`<tr><td>${it.RowKey}</td><td>${it.PartitionKey}</td><td>${it.timestamp}</td><td>${it.PredictedValue}</td><td>${lags}</td></tr>`);
+        }
+        html.push('</tbody></table>');
+        document.getElementById('metrics').innerHTML = '<h4>Predições Table Storage</h4>' + html.join('');
+    }catch(e){
+        log('Erro ao buscar predições Table: ' + e);
+        document.getElementById('metrics').innerText = 'Erro ao buscar predições Table: ' + e.message;
+    }
+}
+
+let predictionChartInstance = null;
+
+async function renderPredictionChart(){
+    try{
+        const res = await fetch(`${API_BASE}/download/predictions`);
+        if(!res.ok){
+            log('Sem CSV de previsões para gráfico.');
+            return;
+        }
+
+        const csv = await res.text();
+        const lines = csv.trim().split('\\n');
+        if(lines.length < 2){
+            log('CSV insuficiente para plotagem.');
+            return;
+        }
+
+        const headers = lines[0].split(',');
+        const predictedIndex = headers.indexOf('predicted');
+        const actualIndex = headers.indexOf('actual');
+
+        const labels = [];
+        const predictedData = [];
+        const actualData = [];
+
+        lines.slice(1).forEach((line, i) => {
+            const cols = line.split(',');
+            labels.push(i + 1);
+            if (predictedIndex >= 0) {
+                predictedData.push(parseFloat(cols[predictedIndex]));
+            }
+            if (actualIndex >= 0) {
+                actualData.push(parseFloat(cols[actualIndex]));
+            }
+        });
+
+        const canvas = document.getElementById('predictionChart');
+        if (!canvas){
+            log('Canvas de gráfico não encontrado no HTML.');
+            return;
+        }
+        const ctx = canvas.getContext('2d');
+
+        if (predictionChartInstance) {
+            predictionChartInstance.destroy();
+        }
+
+        predictionChartInstance = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Valor Previsto',
+                        data: predictedData,
+                        borderColor: '#2563eb',
+                        backgroundColor: 'rgba(37,99,235,0.15)',
+                        tension: 0.3
+                    },
+                    {
+                        label: 'Valor Real',
+                        data: actualData,
+                        borderColor: '#16a34a',
+                        backgroundColor: 'rgba(22,163,74,0.15)',
+                        tension: 0.3
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { display: true }
+                },
+                scales: {
+                    x: { title: { display: true, text: 'Registro' } },
+                    y: { title: { display: true, text: 'Valor' } }
+                }
+            }
+        });
+
+        log('Gráfico de previsões renderizado.');
+    }catch(e){
+        log('Erro ao gerar gráfico: ' + e);
+    }
+}
+
+log('Frontend pronto. API base: ' + API_BASE);
+
+document.addEventListener("DOMContentLoaded", () => {
+    log("Dashboard carregado.");
+});
+</script>
+</body>
+</html>
 """
 
 HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
