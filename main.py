@@ -267,6 +267,56 @@ async def predictions_table():
         # Retorna JSON sempre válido com mensagem de erro
         return {"predictions_table": [], "error": str(e)}
     # ============================================================
+# ======================================================
+# 🔐 Criptografia Simples com Fernet (sem secrets)
+# Tudo dentro de UM BLOCO como você pediu
+# ======================================================
+
+from cryptography.fernet import Fernet
+
+# ------------------------------------------------------
+# Nome do arquivo que vai armazenar a chave no Blob
+# ------------------------------------------------------
+KEY_BLOB_NAME = "fernet.key"
+
+# ------------------------------------------------------
+# Função para gerar ou carregar a chave do Blob
+# ------------------------------------------------------
+def get_crypto_key():
+    try:
+        # tenta baixar chave existente
+        key = download_from_blob(KEY_BLOB_NAME)
+        return Fernet(key)
+    except:
+        # não existe → criar nova e subir
+        key = Fernet.generate_key()
+        upload_to_blob(KEY_BLOB_NAME, key)
+        return Fernet(key)
+
+# inicializa o objeto Fernet
+FERNET = get_crypto_key()
+
+# ------------------------------------------------------
+# UPLOAD criptografado
+# ------------------------------------------------------
+def upload_to_blob(blob_name: str, data: bytes):
+    try:
+        encrypted = FERNET.encrypt(data)
+        blob_client = blob_container.get_blob_client(blob_name)
+        blob_client.upload_blob(encrypted, overwrite=True)
+    except Exception as e:
+        raise RuntimeError(f"Erro upload blob {blob_name}: {e}")
+
+# ------------------------------------------------------
+# DOWNLOAD descriptografado
+# ------------------------------------------------------
+def download_from_blob(blob_name: str) -> bytes:
+    try:
+        blob_client = blob_container.get_blob_client(blob_name)
+        encrypted = blob_client.download_blob().readall()
+        return FERNET.decrypt(encrypted)
+    except Exception as e:
+        raise RuntimeError(f"Erro download blob {blob_name}: {e}")
 
 
 @app.get("/logs")
