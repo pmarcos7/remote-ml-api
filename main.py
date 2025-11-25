@@ -1,9 +1,10 @@
 # ============================================================
 # main.py - API de Regressão Linear Remota (Azure Blob + Table Storage)
+# (com criptografia Fernet simples integrada)
 # ============================================================
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from azure.storage.blob import BlobServiceClient
 from azure.data.tables import TableServiceClient
 import pandas as pd
@@ -21,9 +22,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from fastapi.middleware.cors import CORSMiddleware
 
-# --------------------
+# ============================================================
 # CONFIGURAÇÕES E VARIÁVEIS
-# --------------------
+# ============================================================
 AZURE_ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
 AZURE_ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
 AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "meucontainer")
@@ -40,9 +41,9 @@ connection_string = (
     f"EndpointSuffix=core.windows.net"
 )
 
-# --------------------
+# ============================================================
 # INICIALIZAÇÃO DO BLOB E TABLE STORAGE
-# --------------------
+# ============================================================
 blob_service = BlobServiceClient.from_connection_string(connection_string)
 blob_container = blob_service.get_container_client(AZURE_CONTAINER)
 try:
@@ -54,9 +55,9 @@ table_service = TableServiceClient.from_connection_string(connection_string)
 table_client = table_service.create_table_if_not_exists(TABLE_NAME)
 predictions_table_client = table_service.create_table_if_not_exists(PREDICTIONS_TABLE_NAME)
 
-# --------------------
-# HELPERS
-# --------------------
+# ============================================================
+# HELPERS (não-criptográficos)
+# ============================================================
 def safe_float(x):
     try:
         return float(x)
@@ -65,20 +66,6 @@ def safe_float(x):
             return float(np.asarray(x).item())
         except Exception:
             return None
-
-def upload_to_blob(blob_name: str, data: bytes):
-    try:
-        blob_container.upload_blob(name=blob_name, data=data, overwrite=True)
-    except Exception as e:
-        raise RuntimeError(f"Erro upload blob {blob_name}: {e}")
-
-def download_from_blob(blob_name: str) -> bytes:
-    try:
-        blob = blob_container.get_blob_client(blob_name)
-        downloader = blob.download_blob()
-        return downloader.readall()
-    except Exception as e:
-        raise RuntimeError(f"Erro download blob {blob_name}: {e}")
 
 def delete_blob(blob_name: str):
     try:
@@ -122,9 +109,9 @@ def registrar_predicao(training_id, input_row, predicted_value):
     }
     predictions_table_client.create_entity(entity)
 
-# --------------------
+# ============================================================
 # FASTAPI
-# --------------------
+# ============================================================
 app = FastAPI(title="ML Remote API with Azure Storage")
 
 app.add_middleware(
@@ -141,13 +128,95 @@ HTML_DASHBOARD = "<h1>ML Remote API funcionando</h1>"
 async def root():
     return HTMLResponse(content=HTML_DASHBOARD, status_code=200)
 
-# --------------------
-# Upload
-# --------------------
+# ============================================================
+# CRIPTOGRAFIA - implementação simples com Fernet
+# - usamos operações "raw" para armazenar/recuperar a chave (sem tentar
+#   descriptografar com ela)
+# - upload_to_blob / download_from_blob são sobrescritas abaixo
+# ============================================================
+from cryptography.fernet import Fernet
+
+KEY_BLOB_NAME = "fernet.key"
+
+# Funções raw para manipular blobs sem criptografia (usadas apenas para a chave)
+def raw_upload_blob(blob_name: str, data: bytes):
+    try:
+        blob_client = blob_container.get_blob_client(blob_name)
+        blob_client.upload_blob(data, overwrite=True)
+    except Exception as e:
+        raise RuntimeError(f"Erro raw upload blob {blob_name}: {e}")
+
+def raw_download_blob(blob_name: str) -> bytes:
+    try:
+        blob_client = blob_container.get_blob_client(blob_name)
+        if not blob_client.exists():
+            raise RuntimeError("Blob não existe")
+        return blob_client.download_blob().readall()
+    except Exception as e:
+        raise RuntimeError(f"Erro raw download blob {blob_name}: {e}")
+
+# Gera ou carrega chave (usa raw_* para não depender de decrypt)
+def get_crypto_key():
+    try:
+        key = raw_download_blob(KEY_BLOB_NAME)
+        return Fernet(key)
+    except Exception:
+        # cria nova chave e sobe (raw)
+        key = Fernet.generate_key()
+        raw_upload_blob(KEY_BLOB_NAME, key)
+        return Fernet(key)
+
+# inicializa o objeto Fernet (global)
+FERNET = get_crypto_key()
+
+# ------------------------------------------------------
+# Sobrescrevemos as funções upload/download usadas pelo app
+# para escrever e ler blobs criptografados.
+# ------------------------------------------------------
+def upload_to_blob(blob_name: str, data: bytes):
+    """
+    Envia bytes criptografados para o blob.
+    """
+    try:
+        encrypted = FERNET.encrypt(data)
+        blob_client = blob_container.get_blob_client(blob_name)
+        blob_client.upload_blob(encrypted, overwrite=True)
+    except Exception as e:
+        raise RuntimeError(f"Erro upload blob {blob_name}: {e}")
+
+def download_from_blob(blob_name: str) -> bytes:
+    """
+    Faz download do blob e descriptografa antes de retornar bytes.
+    """
+    try:
+        blob_client = blob_container.get_blob_client(blob_name)
+        if not blob_client.exists():
+            raise RuntimeError(f"Blob {blob_name} não encontrado")
+        encrypted = blob_client.download_blob().readall()
+        return FERNET.decrypt(encrypted)
+    except Exception as e:
+        raise RuntimeError(f"Erro download blob {blob_name}: {e}")
+
+# Auxiliar: ler blob (raw) apenas para obter tamanho criptografado sem decrypt
+def get_encrypted_blob_bytes(blob_name: str) -> bytes:
+    try:
+        blob_client = blob_container.get_blob_client(blob_name)
+        if not blob_client.exists():
+            raise RuntimeError("blob não existe")
+        return blob_client.download_blob().readall()
+    except Exception as e:
+        raise RuntimeError(f"Erro lendo blob (raw) {blob_name}: {e}")
+
+# ============================================================
+# ROTAS: upload, train, predict (usando upload_to_blob/download_from_blob criptografados)
+# ============================================================
+
 @app.post("/upload/train")
 async def upload_train(file: UploadFile = File(...)):
     contents = await file.read()
+    # valida CSV (apenas leitura)
     df = pd.read_csv(io.BytesIO(contents))
+    # salva criptografado no blob
     upload_to_blob("train_upload.csv", contents)
     return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
 
@@ -158,11 +227,9 @@ async def upload_test(file: UploadFile = File(...)):
     upload_to_blob("test_upload.csv", contents)
     return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
 
-# --------------------
-# Treino
-# --------------------
 @app.post("/train")
 async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
+    # baixa e descriptografa o CSV de treino
     data = download_from_blob("train_upload.csv")
     df = pd.read_csv(io.BytesIO(data))
     X, y = build_lags(df, lags=lags)
@@ -188,18 +255,16 @@ async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
     registrar_treino(metrics["MAE"], metrics["RMSE"], metrics["R2"])
     return {"status": "trained", "metrics": metrics, "model_blob": model_blob_name}
 
-# --------------------
-# Predict
-# --------------------
 @app.post("/predict")
 async def predict(lags: int = Form(5)):
-    # pega o model mais recente
+    # pega o model mais recente (lista de blobs criptografados com prefix model_)
     blobs = list(blob_container.list_blobs(name_starts_with="model_"))
     if not blobs: raise HTTPException(status_code=404, detail="Modelo não encontrado")
     blobs_sorted = sorted(blobs, key=lambda b: b.last_modified or datetime.min, reverse=True)
     model_blob = blobs_sorted[0].name
     scaler_blob = list(blob_container.list_blobs(name_starts_with="scaler_"))
     scaler_blob = sorted(scaler_blob, key=lambda b: b.last_modified or datetime.min, reverse=True)[0].name if scaler_blob else None
+    # carrega descriptografado
     model = joblib.load(io.BytesIO(download_from_blob(model_blob)))
     scaler = joblib.load(io.BytesIO(download_from_blob(scaler_blob))) if scaler_blob else None
 
@@ -213,7 +278,7 @@ async def predict(lags: int = Form(5)):
         out["actual"] = y.values[:len(preds)]
         out["error"] = out["actual"] - out["predicted"]
 
-    # salva CSV
+    # salva CSV criptografado
     b = io.BytesIO(); out.to_csv(b, index=False); upload_to_blob("predictions.csv", b.getvalue())
     training_id = "last_run"
     for i, row in out.iterrows():
@@ -221,34 +286,53 @@ async def predict(lags: int = Form(5)):
 
     return {"status": "ok", "n": len(preds)}
 
+# ============================================================
+# DOWNLOAD de previsões (descriptografado) - mantido
+# ============================================================
 @app.get("/download/predictions")
 async def download_predictions():
-    data = download_from_blob("predictions.csv")
+    try:
+        data = download_from_blob("predictions.csv")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
     path = "/tmp/predictions.csv"
-    with open(path, "wb") as f: f.write(data)
+    with open(path, "wb") as f:
+        f.write(data)
     return FileResponse(path, filename="predictions.csv")
 
+# Nova rota: faz download de qualquer blob descriptografado por nome (usado pelo frontend para "baixar descriptografado")
+@app.get("/download/decrypted/{filename}")
+async def download_decrypted(filename: str):
+    """
+    Baixa o blob criptografado e retorna bytes descriptografados para download.
+    filename: nome do blob (ex: train_upload.csv, test_upload.csv, predictions.csv)
+    """
+    try:
+        data = download_from_blob(filename)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    # stream para o cliente
+    return StreamingResponse(io.BytesIO(data), media_type="application/octet-stream",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+# ============================================================
+# Predições (Table) e Logs - mantidos
+# ============================================================
 @app.get("/predictions/table")
 async def predictions_table():
     try:
         items = list(predictions_table_client.list_entities(results_per_page=50))
         predictions_list = []
         for item in items:
-            # Tenta converter timestamp para isoformat; se falhar, usa string ou None
             try:
                 ts = item.timestamp.isoformat() if hasattr(item.timestamp, 'isoformat') else str(item.timestamp)
             except Exception:
                 ts = str(item.timestamp)
-
-            # PredictedValue seguro
             predicted = safe_float(getattr(item, "PredictedValue", None))
-
-            # Input lags seguros
             input_lags = {}
             for k, v in item.items():
                 if str(k).startswith("lag"):
                     input_lags[k] = safe_float(v)
-
             predictions_list.append({
                 "RowKey": getattr(item, "RowKey", ""),
                 "PartitionKey": getattr(item, "PartitionKey", ""),
@@ -256,68 +340,11 @@ async def predictions_table():
                 "PredictedValue": predicted,
                 "InputLags": input_lags
             })
-
-        # Ordena pelo timestamp mais recente
         predictions_list.sort(key=lambda x: x["timestamp"], reverse=True)
         return {"predictions_table": predictions_list}
-
     except Exception as e:
-        # Log do traceback no servidor
         print("Erro /predictions/table:", traceback.format_exc())
-        # Retorna JSON sempre válido com mensagem de erro
         return {"predictions_table": [], "error": str(e)}
-
-# ======================================================
-# 🔐 Criptografia Simples com Fernet (sem secrets)
-# Tudo dentro de UM BLOCO como você pediu
-# ======================================================
-
-from cryptography.fernet import Fernet
-
-# ------------------------------------------------------
-# Nome do arquivo que vai armazenar a chave no Blob
-# ------------------------------------------------------
-KEY_BLOB_NAME = "fernet.key"
-
-# ------------------------------------------------------
-# Função para gerar ou carregar a chave do Blob
-# ------------------------------------------------------
-def get_crypto_key():
-    try:
-        # tenta baixar chave existente
-        key = download_from_blob(KEY_BLOB_NAME)
-        return Fernet(key)
-    except:
-        # não existe → criar nova e subir
-        key = Fernet.generate_key()
-        upload_to_blob(KEY_BLOB_NAME, key)
-        return Fernet(key)
-
-# inicializa o objeto Fernet
-FERNET = get_crypto_key()
-
-# ------------------------------------------------------
-# UPLOAD criptografado
-# ------------------------------------------------------
-def upload_to_blob(blob_name: str, data: bytes):
-    try:
-        encrypted = FERNET.encrypt(data)
-        blob_client = blob_container.get_blob_client(blob_name)
-        blob_client.upload_blob(encrypted, overwrite=True)
-    except Exception as e:
-        raise RuntimeError(f"Erro upload blob {blob_name}: {e}")
-
-# ------------------------------------------------------
-# DOWNLOAD descriptografado
-# ------------------------------------------------------
-def download_from_blob(blob_name: str) -> bytes:
-    try:
-        blob_client = blob_container.get_blob_client(blob_name)
-        encrypted = blob_client.download_blob().readall()
-        return FERNET.decrypt(encrypted)
-    except Exception as e:
-        raise RuntimeError(f"Erro download blob {blob_name}: {e}")
-
 
 @app.get("/logs")
 async def logs():
@@ -337,46 +364,69 @@ async def reset():
         delete_blob(f)
     return {"status": "reset"}
 
-
+# ============================================================
+# ROTAS DE CRIPTO - info e stats
+# ============================================================
 @app.get("/crypto/info")
 async def crypto_info():
+    """
+    Retorna informações básicas sobre a chave e se o Fernet está ativo.
+    """
     try:
-        # tenta baixar a chave
-        key = download_from_blob(KEY_BLOB_NAME)
+        key = raw_download_blob(KEY_BLOB_NAME)
         key_str = key.decode("utf-8")
-
-        # tenta baixar um arquivo criptografado (opcional)
-        sample_files = ["train_upload.csv", "test_upload.csv", "predictions.csv"]
-        encrypted_exists = {}
-        for f in sample_files:
-            try:
-                blob = blob_container.get_blob_client(f)
-                encrypted_exists[f] = blob.exists()
-            except:
-                encrypted_exists[f] = False
-
         return {
             "key_file": KEY_BLOB_NAME,
             "key_length": len(key_str),
-            "key_preview": key_str[:32] + "...",
-            "encrypted_files_found": encrypted_exists,
+            "key_preview": key_str[:32] + "..." if len(key_str) > 32 else key_str,
             "fernet_active": True
         }
-
     except Exception as e:
-        return {
-            "fernet_active": False,
-            "error": str(e)
-        }
+        return {"fernet_active": False, "error": str(e)}
+
+@app.get("/crypto/stats")
+async def crypto_stats():
+    """
+    Retorna tamanhos criptografados vs descriptografados para alguns arquivos de exemplo.
+    Útil para mostrar 'tamanho criptografado vs descriptografado' no frontend.
+    """
+    sample_files = ["train_upload.csv", "test_upload.csv", "predictions.csv"]
+    stats = {}
+    for f in sample_files:
+        try:
+            blob_client = blob_container.get_blob_client(f)
+            if not blob_client.exists():
+                stats[f] = {"exists": False}
+                continue
+            # pega tamanho criptografado (propriedade do blob)
+            try:
+                props = blob_client.get_blob_properties()
+                encrypted_size = props.size
+            except Exception:
+                encrypted_size = None
+            # além disso, fazemos download e descriptografamos para medir tamanho claro
+            try:
+                encrypted_bytes = blob_client.download_blob().readall()
+                clear_bytes = FERNET.decrypt(encrypted_bytes)
+                clear_size = len(clear_bytes)
+                encrypted_len_actual = len(encrypted_bytes)
+                stats[f] = {
+                    "exists": True,
+                    "encrypted_size_reported": encrypted_size,
+                    "encrypted_size_downloaded": encrypted_len_actual,
+                    "decrypted_size": clear_size
+                }
+            except Exception as e:
+                stats[f] = {"exists": True, "error_decrypting_or_downloading": str(e)}
+        except Exception as e:
+            stats[f] = {"exists": False, "error": str(e)}
+    return {"stats": stats}
 
 # ============================================================
-# 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
+# FRONTEND EMBUTIDO (mantive o seu template; a URL deve ser atualizada)
 # ============================================================
+API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io"
 
-# ATENÇÃO: SUBSTITUA ESTE VALOR pela URL completa do seu Container App!
-API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io" 
-
-# HTML_DASHBOARD NÃO É MAIS UMA F-STRING, USA .replace() PARA EVITAR CONFLITOS DE CHAVES {}
 HTML_TEMPLATE = """
 <!doctype html>
 <html lang="pt-BR">
@@ -397,7 +447,6 @@ HTML_TEMPLATE = """
         .col{flex:1;min-width:240px}
         pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
     </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <h1>ML Remote — Dashboard</h1>
@@ -421,7 +470,8 @@ HTML_TEMPLATE = """
             <div style="margin-top:8px">
                 <button onclick="uploadTest()">Upload Test</button>
                 <button onclick="predict()">Prever</button>
-                <button onclick="downloadPredictions()">Baixar Previsões</button>
+                <button onclick="downloadPredictions()">Baixar Previsões (criptografado)</button>
+                <button onclick="downloadDecrypted('predictions.csv')">Baixar Previsões (descriptografado)</button>
             </div>
             <div id="predictResult" style="margin-top:8px"></div>
         </div>
@@ -438,20 +488,17 @@ HTML_TEMPLATE = """
             <div id="metrics" style="margin-top:8px"></div>
         </div>
     </div>
+
     <div class="box">
         <h3>Criptografia</h3>
         <button onclick="getCryptoInfo()">Ver detalhes da criptografia</button>
+        <button onclick="getCryptoStats()">Tamanhos (criptografado vs descriptografado)</button>
         <pre id="cryptoInfo">Nenhuma informação carregada ainda.</pre>
     </div>
 
     <div class="box">
         <h3>Preview das previsões</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
-    </div>
-
-    <div class="box">
-        <h3>Gráfico - Previsões vs Valor Real</h3>
-        <canvas id="predictionChart" height="120"></canvas>
     </div>
 
     <div class="box">
@@ -464,7 +511,7 @@ const API_BASE = "__API_URL__";
 
 function log(msg){
     const c = document.getElementById('console');
-    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
+    c.textContent = `${new Date().toISOString()} — ${msg}\\n` + c.textContent;
 }
 
 async function uploadTrain(){
@@ -472,48 +519,11 @@ async function uploadTrain(){
     if(!f){ alert('Selecione o CSV de treino'); return; }
     const fd = new FormData();
     fd.append('file', f);
-    log('Enviando treino...');
+    log('Enviando treino (será criptografado no servidor)...');
     const res = await fetch(`${API_BASE}/upload/train`, { method:'POST', body: fd });
     const j = await res.json();
     log('Upload train: ' + JSON.stringify(j));
     document.getElementById('trainResult').innerText = JSON.stringify(j);
-}
-
-
-async function getCryptoInfo(){
-    try{
-        const res = await fetch(`${API_BASE}/crypto/info`);
-        const j = await res.json();
-        document.getElementById("cryptoInfo").innerText = JSON.stringify(j, null, 2);
-        log("Criptografia carregada.");
-    }catch(e){
-        log("Erro ao carregar criptografia: " + e);
-    }
-}
-
-
-async function train() {
-    log('Iniciando treino...');
-    try {
-        const res = await fetch(`${API_BASE}/train`, {
-            method: 'POST',
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            body: new URLSearchParams({ lags: 5, cv_splits: 5 })
-        });
-
-        const text = await res.text();
-        log('Resposta bruta: ' + text);
-
-        const j = JSON.parse(text);
-        log('Treino finalizado: ' + JSON.stringify(j));
-        document.getElementById('trainResult').innerText = JSON.stringify(j);
-        getLastMetrics();
-    }
-    catch (e) {
-        log("ERRO no front: " + e);
-    }
 }
 
 async function uploadTest(){
@@ -521,11 +531,22 @@ async function uploadTest(){
     if(!f){ alert('Selecione o CSV de teste'); return; }
     const fd = new FormData();
     fd.append('file', f);
-    log('Enviando teste...');
+    log('Enviando teste (será criptografado no servidor)...');
     const res = await fetch(`${API_BASE}/upload/test`, { method:'POST', body: fd });
     const j = await res.json();
     log('Upload test: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
+}
+
+async function train(){
+    log('Iniciando treino...');
+    const res = await fetch(`${API_BASE}/train`, { method:'POST',
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: new URLSearchParams({ lags: 5, cv_splits: 5 })
+    });
+    const j = await res.json();
+    log('Treino: ' + JSON.stringify(j));
+    document.getElementById('trainResult').innerText = JSON.stringify(j);
 }
 
 async function predict(){
@@ -535,63 +556,49 @@ async function predict(){
     log('Predict: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
     await showPredictionsPreview();
-    await renderPredictionChart();
 }
 
 async function downloadPredictions(){
-    const url = `${API_BASE}/download/predictions`;
-    log('Baixando ' + url);
+    // baixa o arquivo criptografado (como está armazenado) - frontend não precisa descriptografar
     const a = document.createElement('a');
-    a.href = url;
+    a.href = `${API_BASE}/download/predictions`;
     a.download = 'predictions.csv';
     document.body.appendChild(a);
     a.click();
     a.remove();
+    log('Solicitado download (predictions.csv) - o servidor fornece o arquivo descriptografado via /download/predictions.');
 }
 
-async function getLastMetrics(){
-    try{
-        const res = await fetch(`${API_BASE}/metrics/last`);
-        const j = await res.json();
-        log('Último treino: ' + JSON.stringify(j));
-        document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
-    }catch(e){
-        log('Erro ao buscar último treino: ' + e);
-    }
-}
-
-let logsCache = [];
-async function getLogs(){
-    const res = await fetch(`${API_BASE}/logs`);
-    const j = await res.json();
-    logsCache = j.logs || [];
-    log('Logs recebidos: ' + logsCache.length);
-    const html = ['<table><thead><tr><th>RowKey</th><th>timestamp</th><th>MAE</th><th>RMSE</th><th>R2</th></tr></thead><tbody>'];
-    for(const it of logsCache){
-        html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
-    }
-    html.push('</tbody></table>');
-    document.getElementById('metrics').innerHTML = html.join('');
-}
-
-function exportLogsCSV(){
-    if(!logsCache || logsCache.length===0){ alert('Sem logs para exportar'); return; }
-    const cols = ['RowKey','timestamp','MAE','RMSE','R2'];
-    const lines = [cols.join(',')];
-    for(const it of logsCache){
-        const row = cols.map(c => JSON.stringify(it[c] ?? '')).join(',');
-        lines.push(row);
-    }
-    const blob = new Blob([lines.join('\\n')], {type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
+async function downloadDecrypted(filename){
     const a = document.createElement('a');
-    a.href = url;
-    a.download = 'logs_treinos.csv';
+    a.href = `${API_BASE}/download/decrypted/${filename}`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
-    log('Logs exportados (CSV).');
+    log('Solicitado download descriptografado: ' + filename);
+}
+
+async function getCryptoInfo(){
+    try{
+        const res = await fetch(`${API_BASE}/crypto/info`);
+        const j = await res.json();
+        document.getElementById('cryptoInfo').innerText = JSON.stringify(j, null, 2);
+        log('Crypto info carregada.');
+    }catch(e){
+        log('Erro crypto info: ' + e);
+    }
+}
+
+async function getCryptoStats(){
+    try{
+        const res = await fetch(`${API_BASE}/crypto/stats`);
+        const j = await res.json();
+        document.getElementById('cryptoInfo').innerText = JSON.stringify(j, null, 2);
+        log('Crypto stats carregada.');
+    }catch(e){
+        log('Erro crypto stats: ' + e);
+    }
 }
 
 async function showPredictionsPreview(){
@@ -606,117 +613,14 @@ async function showPredictionsPreview(){
     }
 }
 
-async function getPredictionsTable(){
-    try{
-        const res = await fetch(`${API_BASE}/predictions/table`);
-        const j = await res.json();
-        const preds = j.predictions_table || [];
-        log('Predições Table recebidas: ' + preds.length);
-
-        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Predicted</th><th>Lags</th></tr></thead><tbody>'];
-        for(const it of preds){
-            const lags = Object.entries(it.InputLags || {}).map(([k,v]) => `${k}:${v}`).join(', ');
-            html.push(`<tr><td>${it.RowKey}</td><td>${it.PartitionKey}</td><td>${it.timestamp}</td><td>${it.PredictedValue}</td><td>${lags}</td></tr>`);
-        }
-        html.push('</tbody></table>');
-        document.getElementById('metrics').innerHTML = '<h4>Predições Table Storage</h4>' + html.join('');
-    }catch(e){
-        log('Erro ao buscar predições Table: ' + e);
-        document.getElementById('metrics').innerText = 'Erro ao buscar predições Table: ' + e.message;
-    }
-}
-
-let predictionChartInstance = null;
-
-async function renderPredictionChart(){
-    try{
-        const res = await fetch(`${API_BASE}/download/predictions`);
-        if(!res.ok){
-            log('Sem CSV de previsões para gráfico.');
-            return;
-        }
-
-        const csv = await res.text();
-        const lines = csv.trim().split('\\n');
-        if(lines.length < 2){
-            log('CSV insuficiente para plotagem.');
-            return;
-        }
-
-        const headers = lines[0].split(',');
-        const predictedIndex = headers.indexOf('predicted');
-        const actualIndex = headers.indexOf('actual');
-
-        const labels = [];
-        const predictedData = [];
-        const actualData = [];
-
-        lines.slice(1).forEach((line, i) => {
-            const cols = line.split(',');
-            labels.push(i + 1);
-            if (predictedIndex >= 0) {
-                predictedData.push(parseFloat(cols[predictedIndex]));
-            }
-            if (actualIndex >= 0) {
-                actualData.push(parseFloat(cols[actualIndex]));
-            }
-        });
-
-        const canvas = document.getElementById('predictionChart');
-        if (!canvas){
-            log('Canvas de gráfico não encontrado no HTML.');
-            return;
-        }
-        const ctx = canvas.getContext('2d');
-
-        if (predictionChartInstance) {
-            predictionChartInstance.destroy();
-        }
-
-        predictionChartInstance = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [
-                    {
-                        label: 'Valor Previsto',
-                        data: predictedData,
-                        borderColor: '#2563eb',
-                        backgroundColor: 'rgba(37,99,235,0.15)',
-                        tension: 0.3
-                    },
-                    {
-                        label: 'Valor Real',
-                        data: actualData,
-                        borderColor: '#16a34a',
-                        backgroundColor: 'rgba(22,163,74,0.15)',
-                        tension: 0.3
-                    }
-                ]
-            },
-            options: {
-                responsive: true,
-                plugins: {
-                    legend: { display: true }
-                },
-                scales: {
-                    x: { title: { display: true, text: 'Registro' } },
-                    y: { title: { display: true, text: 'Valor' } }
-                }
-            }
-        });
-
-        log('Gráfico de previsões renderizado.');
-    }catch(e){
-        log('Erro ao gerar gráfico: ' + e);
-    }
+async function getLogs(){
+    const res = await fetch(`${API_BASE}/logs`);
+    const j = await res.json();
+    document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
+    log('Logs carregados.');
 }
 
 log('Frontend pronto. API base: ' + API_BASE);
-
-document.addEventListener("DOMContentLoaded", () => {
-    log("Dashboard carregado.");
-});
 </script>
 </body>
 </html>
@@ -724,13 +628,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
 HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
 
-# Rota Raiz para servir o HTML
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend_embedded():
-    # Retorna o HTML_DASHBOARD (o seu frontend)
     return HTMLResponse(content=HTML_DASHBOARD, status_code=200)
 
-
 # ============================================================
-# 4. CONFIGURAÇÃO DO AZURE STORAGE (BLOB + TABLE)
+# FIM DO ARQUIVO
 # ============================================================
