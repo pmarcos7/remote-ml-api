@@ -257,14 +257,14 @@ async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
 
 @app.post("/predict")
 async def predict(lags: int = Form(5)):
-    # pega o model mais recente (lista de blobs criptografados com prefix model_)
+    # pega o model mais recente
     blobs = list(blob_container.list_blobs(name_starts_with="model_"))
     if not blobs: raise HTTPException(status_code=404, detail="Modelo não encontrado")
     blobs_sorted = sorted(blobs, key=lambda b: b.last_modified or datetime.min, reverse=True)
     model_blob = blobs_sorted[0].name
     scaler_blob = list(blob_container.list_blobs(name_starts_with="scaler_"))
     scaler_blob = sorted(scaler_blob, key=lambda b: b.last_modified or datetime.min, reverse=True)[0].name if scaler_blob else None
-    # carrega descriptografado
+
     model = joblib.load(io.BytesIO(download_from_blob(model_blob)))
     scaler = joblib.load(io.BytesIO(download_from_blob(scaler_blob))) if scaler_blob else None
 
@@ -273,6 +273,7 @@ async def predict(lags: int = Form(5)):
     X, y = build_lags(df, lags=lags)
     X_scaled = scaler.transform(X) if scaler else X
     preds = model.predict(X_scaled)
+    
     out = pd.DataFrame({"predicted": preds})
     if "time" in df.columns:
         out["actual"] = y.values[:len(preds)]
@@ -280,11 +281,15 @@ async def predict(lags: int = Form(5)):
 
     # salva CSV criptografado
     b = io.BytesIO(); out.to_csv(b, index=False); upload_to_blob("predictions.csv", b.getvalue())
+
     training_id = "last_run"
     for i, row in out.iterrows():
         registrar_predicao(training_id, X.iloc[i].to_dict(), float(row["predicted"]))
 
-    return {"status": "ok", "n": len(preds)}
+    # Retorna também os dados para gerar gráfico no frontend
+    preview = out.head(100).to_dict(orient="records")  # limita a 100 linhas para não sobrecarregar
+    return {"status": "ok", "n": len(preds), "data": preview}
+
 
 # ============================================================
 # DOWNLOAD de previsões (descriptografado) - mantido
@@ -554,8 +559,16 @@ async function predict(){
     const res = await fetch(`${API_BASE}/predict`, { method:'POST' });
     const j = await res.json();
     log('Predict: ' + JSON.stringify(j));
-    document.getElementById('predictResult').innerText = JSON.stringify(j);
-    await showPredictionsPreview();
+    document.getElementById('predictResult').innerText = JSON.stringify(j, null, 2);
+
+    if(j.data){
+        let html = "<table><tr><th>Predito</th><th>Real</th></tr>";
+        j.data.forEach(r => {
+            html += `<tr><td>${r.predicted.toFixed(2)}</td><td>${r.actual ? r.actual.toFixed(2) : "-"}</td></tr>`;
+        });
+        html += "</table>";
+        document.getElementById('predPreview').innerHTML = html;
+    }
 }
 
 async function downloadPredictions(){
