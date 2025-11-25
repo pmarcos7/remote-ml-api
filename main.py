@@ -446,7 +446,7 @@ async function uploadTrain(){
     log('Upload train: ' + JSON.stringify(j));
     document.getElementById('trainResult').innerText = JSON.stringify(j);
 }
-<script>
+
 
 async function getCryptoInfo(){
     try{
@@ -458,7 +458,7 @@ async function getCryptoInfo(){
         log("Erro ao carregar criptografia: " + e);
     }
 }
-</script>
+
 
 async function train() {
     log('Iniciando treino...');
