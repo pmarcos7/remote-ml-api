@@ -451,7 +451,6 @@ HTML_TEMPLATE = """
         .row{display:flex;gap:12px;flex-wrap:wrap}
         .col{flex:1;min-width:240px}
         pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
-        canvas{background:#fff;border-radius:8px;display:block;margin-top:12px}
     </style>
 </head>
 <body>
@@ -505,7 +504,11 @@ HTML_TEMPLATE = """
     <div class="box">
         <h3>Preview das previsões</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
-        <canvas id="predChart" width="400" height="200"></canvas>
+    </div>
+
+    <div class="box">
+        <h3>Série Temporal - Predições vs Real</h3>
+        <canvas id="timeSeriesChart" width="600" height="200"></canvas>
     </div>
 
     <div class="box">
@@ -513,9 +516,7 @@ HTML_TEMPLATE = """
         <pre id="console">Pronto.</pre>
     </div>
 
-    <!-- Chart.js CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 const API_BASE = "__API_URL__";
 
@@ -524,7 +525,6 @@ function log(msg){
     c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
 }
 
-// === Funções globais para botões ===
 async function uploadTrain(){
     const f = document.getElementById('trainFile').files[0];
     if(!f){ alert('Selecione o CSV de treino'); return; }
@@ -567,42 +567,61 @@ async function predict(){
     log('Predict: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j, null, 2);
 
-    // Gerar gráfico
-    try {
-        const csvRes = await fetch(`${API_BASE}/download/predictions`);
-        const txt = await csvRes.text();
-        const lines = txt.trim().split('\n');
-        const header = lines.shift().split(',');
-        const predictedIndex = header.indexOf('predicted');
-        const actualIndex = header.indexOf('actual');
-        const labels = [];
-        const predictedData = [];
-        const actualData = [];
-        lines.forEach((line,i)=>{
-            const cols = line.split(',');
-            labels.push(i+1);
-            predictedData.push(parseFloat(cols[predictedIndex]));
-            actualData.push(actualIndex>=0 ? parseFloat(cols[actualIndex]) : null);
+    if(j.data){
+        let html = "<table><tr><th>Predito</th><th>Real</th></tr>";
+        j.data.forEach(r => {
+            html += `<tr><td>${r.predicted.toFixed(2)}</td><td>${r.actual ? r.actual.toFixed(2) : "-"}</td></tr>`;
         });
+        html += "</table>";
+        document.getElementById('predPreview').innerHTML = html;
 
-        const ctx = document.getElementById('predChart').getContext('2d');
-        if(window.predChartObj) window.predChartObj.destroy(); // destrói se existir
-        window.predChartObj = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [
-                    {label:'Predito', data: predictedData, borderColor:'rgb(54, 162, 235)', fill:false, tension:0.1},
-                    {label:'Real', data: actualData, borderColor:'rgb(255, 99, 132)', fill:false, tension:0.1}
-                ]
-            },
-            options: {
-                responsive:true,
-                plugins: {legend:{position:'top'}},
-                scales: {x:{title:{display:true,text:'Index'}}, y:{title:{display:true,text:'Valor'}}}
+        // Atualiza o gráfico
+        updateTimeSeriesChart(j.data);
+    }
+}
+
+function updateTimeSeriesChart(data) {
+    const ctx = document.getElementById('timeSeriesChart').getContext('2d');
+
+    if (window.tsChart) {
+        window.tsChart.destroy();
+    }
+
+    const labels = data.map((_, i) => `T${i+1}`);
+    const predicted = data.map(d => d.predicted);
+    const actual = data.map(d => d.actual ?? null);
+
+    window.tsChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'Predito',
+                    data: predicted,
+                    borderColor: 'rgb(54, 162, 235)',
+                    backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                    tension: 0.3
+                },
+                {
+                    label: 'Real',
+                    data: actual,
+                    borderColor: 'rgb(255, 99, 132)',
+                    backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: { legend: { position: 'top' } },
+            scales: {
+                x: { display: true, title: { display: true, text: 'Tempo' } },
+                y: { display: true, title: { display: true, text: 'Valor' } }
             }
-        });
-    } catch(e){ log('Erro ao gerar gráfico: '+e); }
+        }
+    });
 }
 
 async function downloadPredictions(){
@@ -631,7 +650,7 @@ async function getCryptoInfo(){
         const j = await res.json();
         document.getElementById('cryptoInfo').innerText = JSON.stringify(j, null, 2);
         log('Crypto info carregada.');
-    }catch(e){ log('Erro crypto info: '+e); }
+    }catch(e){ log('Erro crypto info: ' + e); }
 }
 
 async function getCryptoStats(){
@@ -640,7 +659,7 @@ async function getCryptoStats(){
         const j = await res.json();
         document.getElementById('cryptoInfo').innerText = JSON.stringify(j, null, 2);
         log('Crypto stats carregada.');
-    }catch(e){ log('Erro crypto stats: '+e); }
+    }catch(e){ log('Erro crypto stats: ' + e); }
 }
 
 async function getLogs(){
@@ -650,21 +669,11 @@ async function getLogs(){
     log('Logs carregados.');
 }
 
-// Força funções para escopo global
-window.uploadTrain = uploadTrain;
-window.uploadTest = uploadTest;
-window.train = train;
-window.predict = predict;
-window.downloadPredictions = downloadPredictions;
-window.downloadDecrypted = downloadDecrypted;
-window.getCryptoInfo = getCryptoInfo;
-window.getCryptoStats = getCryptoStats;
-window.getLogs = getLogs;
-
 log('Frontend pronto. API base: ' + API_BASE);
 </script>
 </body>
 </html>
+
 
 
 """
