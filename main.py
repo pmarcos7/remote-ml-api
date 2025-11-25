@@ -337,6 +337,38 @@ async def reset():
         delete_blob(f)
     return {"status": "reset"}
 
+
+@app.get("/crypto/info")
+async def crypto_info():
+    try:
+        # tenta baixar a chave
+        key = download_from_blob(KEY_BLOB_NAME)
+        key_str = key.decode("utf-8")
+
+        # tenta baixar um arquivo criptografado (opcional)
+        sample_files = ["train_upload.csv", "test_upload.csv", "predictions.csv"]
+        encrypted_exists = {}
+        for f in sample_files:
+            try:
+                blob = blob_container.get_blob_client(f)
+                encrypted_exists[f] = blob.exists()
+            except:
+                encrypted_exists[f] = False
+
+        return {
+            "key_file": KEY_BLOB_NAME,
+            "key_length": len(key_str),
+            "key_preview": key_str[:32] + "...",
+            "encrypted_files_found": encrypted_exists,
+            "fernet_active": True
+        }
+
+    except Exception as e:
+        return {
+            "fernet_active": False,
+            "error": str(e)
+        }
+
 # ============================================================
 # 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
 # ============================================================
