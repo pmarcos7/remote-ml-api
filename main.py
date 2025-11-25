@@ -14,7 +14,6 @@ import uuid
 from datetime import datetime
 import numpy as np
 import traceback
-import typing
 
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MinMaxScaler
@@ -87,18 +86,7 @@ def delete_blob(blob_name: str):
     except Exception:
         pass
 
-def list_blobs_with_prefix(prefix: str) -> typing.List[str]:
-    return [b.name for b in blob_container.list_blobs(name_starts_with=prefix)]
-
-def latest_blob_by_prefix(prefix: str) -> typing.Optional[str]:
-    blobs = list(blob_container.list_blobs(name_starts_with=prefix))
-    if not blobs:
-        return None
-    blobs_sorted = sorted(blobs, key=lambda b: b.last_modified or datetime.min, reverse=True)
-    return blobs_sorted[0].name
-
 def build_lags(df, lags=5, target="time"):
-    # Se os lags já estiverem na tabela, usa direto
     if all(f"lag{i}" in df.columns for i in range(1, lags + 1)):
         X = df[[f"lag{i}" for i in range(1, lags + 1)]]
         y = df[target]
@@ -113,7 +101,7 @@ def build_lags(df, lags=5, target="time"):
     y = new_df[target]
     return X, y
 
-def registrar_treino(mae, rmse, r2, extra: dict = None):
+def registrar_treino(mae, rmse, r2):
     entity = {
         "PartitionKey": "Treinos",
         "RowKey": str(uuid.uuid4()),
@@ -122,13 +110,6 @@ def registrar_treino(mae, rmse, r2, extra: dict = None):
         "RMSE": safe_float(rmse),
         "R2": safe_float(r2)
     }
-    if extra:
-        # adiciona campos extras se houver (ex: lags, cv_splits)
-        for k, v in extra.items():
-            try:
-                entity[k] = str(v)
-            except Exception:
-                entity[k] = "__UNSERIALIZABLE__"
     table_client.create_entity(entity)
 
 def registrar_predicao(training_id, input_row, predicted_value):
@@ -154,7 +135,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+HTML_DASHBOARD = "<h1>ML Remote API funcionando</h1>"
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -196,7 +177,6 @@ async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
         maes.append(mean_absolute_error(y.iloc[val], preds))
         rmses.append(np.sqrt(mean_squared_error(y.iloc[val], preds)))
         r2s.append(r2_score(y.iloc[val], preds))
-    # Treina final
     model = LinearRegression()
     model.fit(X_scaled, y)
     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -204,18 +184,9 @@ async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
     scaler_blob_name = f"scaler_{ts}.joblib"
     b = io.BytesIO(); joblib.dump(model, b); upload_to_blob(model_blob_name, b.getvalue())
     b2 = io.BytesIO(); joblib.dump(scaler, b2); upload_to_blob(scaler_blob_name, b2.getvalue())
-
     metrics = {"MAE": float(np.mean(maes)), "RMSE": float(np.mean(rmses)), "R2": float(np.mean(r2s))}
-    # salva métricas como CSV no Blob com timestamp
-    metrics_df = pd.DataFrame([metrics])
-    bm = io.BytesIO()
-    metrics_df.to_csv(bm, index=False)
-    metrics_blob_name = f"train_results_{ts}.csv"
-    upload_to_blob(metrics_blob_name, bm.getvalue())
-
-    registrar_treino(metrics["MAE"], metrics["RMSE"], metrics["R2"], extra={"lags": lags, "cv_splits": cv_splits, "metrics_blob": metrics_blob_name})
-
-    return {"status": "trained", "metrics": metrics, "model_blob": model_blob_name, "metrics_blob": metrics_blob_name}
+    registrar_treino(metrics["MAE"], metrics["RMSE"], metrics["R2"])
+    return {"status": "trained", "metrics": metrics, "model_blob": model_blob_name}
 
 # --------------------
 # Predict
@@ -223,10 +194,12 @@ async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
 @app.post("/predict")
 async def predict(lags: int = Form(5)):
     # pega o model mais recente
-    model_blob = latest_blob_by_prefix("model_")
-    if not model_blob:
-        raise HTTPException(status_code=404, detail="Modelo não encontrado")
-    scaler_blob = latest_blob_by_prefix("scaler_")
+    blobs = list(blob_container.list_blobs(name_starts_with="model_"))
+    if not blobs: raise HTTPException(status_code=404, detail="Modelo não encontrado")
+    blobs_sorted = sorted(blobs, key=lambda b: b.last_modified or datetime.min, reverse=True)
+    model_blob = blobs_sorted[0].name
+    scaler_blob = list(blob_container.list_blobs(name_starts_with="scaler_"))
+    scaler_blob = sorted(scaler_blob, key=lambda b: b.last_modified or datetime.min, reverse=True)[0].name if scaler_blob else None
     model = joblib.load(io.BytesIO(download_from_blob(model_blob)))
     scaler = joblib.load(io.BytesIO(download_from_blob(scaler_blob))) if scaler_blob else None
 
@@ -240,34 +213,20 @@ async def predict(lags: int = Form(5)):
         out["actual"] = y.values[:len(preds)]
         out["error"] = out["actual"] - out["predicted"]
 
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    pred_blob_name = f"predictions_{ts}.csv"
-    # salva CSV com timestamp
-    b = io.BytesIO(); out.to_csv(b, index=False); upload_to_blob(pred_blob_name, b.getvalue())
-    # também salva/atualiza um alias 'predictions.csv' para facilitar o download direto
-    upload_to_blob("predictions.csv", b.getvalue())
-
-    training_id = ts  # usa timestamp do run como id único
+    # salva CSV
+    b = io.BytesIO(); out.to_csv(b, index=False); upload_to_blob("predictions.csv", b.getvalue())
+    training_id = "last_run"
     for i, row in out.iterrows():
-        try:
-            registrar_predicao(training_id, X.iloc[i].to_dict(), float(row["predicted"]))
-        except Exception:
-            # se falhar registrar, continua mas loga
-            print("Erro registrar_predicao:", traceback.format_exc())
+        registrar_predicao(training_id, X.iloc[i].to_dict(), float(row["predicted"]))
 
-    return {"status": "ok", "n": len(preds), "predictions_blob": pred_blob_name}
+    return {"status": "ok", "n": len(preds)}
 
 @app.get("/download/predictions")
 async def download_predictions():
-    # tenta pegar o latest predictions_{ts}.csv, se não houver, usa predictions.csv
-    latest_pred = latest_blob_by_prefix("predictions_")
-    blob_to_download = latest_pred or ("predictions.csv" if "predictions.csv" in list_blobs_with_prefix("") else None)
-    if not blob_to_download:
-        raise HTTPException(status_code=404, detail="Nenhum arquivo de previsões encontrado")
-    data = download_from_blob(blob_to_download)
+    data = download_from_blob("predictions.csv")
     path = "/tmp/predictions.csv"
     with open(path, "wb") as f: f.write(data)
-    return FileResponse(path, filename=os.path.basename(blob_to_download))
+    return FileResponse(path, filename="predictions.csv")
 
 @app.get("/predictions/table")
 async def predictions_table():
@@ -308,62 +267,82 @@ async def predictions_table():
         # Retorna JSON sempre válido com mensagem de erro
         return {"predictions_table": [], "error": str(e)}
 
+# ======================================================
+# 🔐 Criptografia Simples com Fernet (sem secrets)
+# Tudo dentro de UM BLOCO como você pediu
+# ======================================================
+
+from cryptography.fernet import Fernet
+
+# ------------------------------------------------------
+# Nome do arquivo que vai armazenar a chave no Blob
+# ------------------------------------------------------
+KEY_BLOB_NAME = "fernet.key"
+
+# ------------------------------------------------------
+# Função para gerar ou carregar a chave do Blob
+# ------------------------------------------------------
+def get_crypto_key():
+    try:
+        # tenta baixar chave existente
+        key = download_from_blob(KEY_BLOB_NAME)
+        return Fernet(key)
+    except:
+        # não existe → criar nova e subir
+        key = Fernet.generate_key()
+        upload_to_blob(KEY_BLOB_NAME, key)
+        return Fernet(key)
+
+# inicializa o objeto Fernet
+FERNET = get_crypto_key()
+
+# ------------------------------------------------------
+# UPLOAD criptografado
+# ------------------------------------------------------
+def upload_to_blob(blob_name: str, data: bytes):
+    try:
+        encrypted = FERNET.encrypt(data)
+        blob_client = blob_container.get_blob_client(blob_name)
+        blob_client.upload_blob(encrypted, overwrite=True)
+    except Exception as e:
+        raise RuntimeError(f"Erro upload blob {blob_name}: {e}")
+
+# ------------------------------------------------------
+# DOWNLOAD descriptografado
+# ------------------------------------------------------
+def download_from_blob(blob_name: str) -> bytes:
+    try:
+        blob_client = blob_container.get_blob_client(blob_name)
+        encrypted = blob_client.download_blob().readall()
+        return FERNET.decrypt(encrypted)
+    except Exception as e:
+        raise RuntimeError(f"Erro download blob {blob_name}: {e}")
+
+
 @app.get("/logs")
 async def logs():
     items = list(table_client.list_entities())
     return {"logs": items}
 
-# endpoint stub para logs do Cosmos (referenciado pelo frontend)
-@app.get("/logs/cosmos")
-async def logs_cosmos():
-    # caso queira integrar com CosmosDB, substitua este stub
-    return {"logs_cosmos": []}
-
 @app.get("/metrics/last")
 async def last_metrics():
     itens = list(table_client.list_entities())
-    if not itens: 
-        return {"message": "Nenhum treino encontrado"}
+    if not itens: return {"message": "Nenhum treino encontrado"}
     itens.sort(key=lambda x: x["timestamp"], reverse=True)
     return itens[0]
 
 @app.post("/reset")
 async def reset():
-    # deleta blobs comuns e todos os modelos/predictions/metrics
-    prefixes = ["train_upload.csv", "test_upload.csv", "predictions.csv"]
-    # deleta blobs com prefixos model_, scaler_, predictions_, train_results_
-    for b in blob_container.list_blobs():
-        name = b.name
-        if (name.startswith("model_") or name.startswith("scaler_") or name.startswith("predictions_") or name.startswith("train_results_") or name in prefixes):
-            try:
-                blob_container.get_blob_client(name).delete_blob()
-            except Exception:
-                pass
-    # (opcional) limpar tabelas
-    try:
-        # limpa tabela Treinos
-        for ent in table_client.list_entities():
-            try:
-                table_client.delete_entity(partition_key=ent["PartitionKey"], row_key=ent["RowKey"])
-            except Exception:
-                pass
-        # limpa tabela Predicoes
-        for ent in predictions_table_client.list_entities():
-            try:
-                predictions_table_client.delete_entity(partition_key=ent["PartitionKey"], row_key=ent["RowKey"])
-            except Exception:
-                pass
-    except Exception:
-        pass
-
+    for f in ["train_upload.csv","test_upload.csv","model.joblib","scaler.joblib","predictions.csv"]:
+        delete_blob(f)
     return {"status": "reset"}
 
 # ============================================================
-# 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO EMBUTIDO)
+# 3. FRONTEND EMBUTIDO E ROTA RAIZ (CÓDIGO NOVO E CORRIGIDO)
 # ============================================================
 
-# ATENÇÃO: SUBSTITUA ESTE VALOR pela URL completa do seu Container App (se for diferente)
-API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io"
+# ATENÇÃO: SUBSTITUA ESTE VALOR pela URL completa do seu Container App!
+API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io" 
 
 # HTML_DASHBOARD NÃO É MAIS UMA F-STRING, USA .replace() PARA EVITAR CONFLITOS DE CHAVES {}
 HTML_TEMPLATE = """
@@ -386,7 +365,6 @@ HTML_TEMPLATE = """
         .col{flex:1;min-width:240px}
         pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
     </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <h1>ML Remote — Dashboard</h1>
@@ -401,6 +379,10 @@ HTML_TEMPLATE = """
                 <button onclick="train()">Treinar</button>
             </div>
             <div id="trainResult" style="margin-top:8px"></div>
+
+            <!-- 🔵 ADIÇÃO PARA EXIBIR CRIPTOGRAFIA -->
+            <h4>Criptografia (Treino)</h4>
+            <pre id="trainEncryption">Nenhum dado criptografado ainda.</pre>
         </div>
 
         <div class="col">
@@ -413,6 +395,10 @@ HTML_TEMPLATE = """
                 <button onclick="downloadPredictions()">Baixar Previsões</button>
             </div>
             <div id="predictResult" style="margin-top:8px"></div>
+
+            <!-- 🔵 ADIÇÃO PARA EXIBIR CRIPTOGRAFIA DO TESTE -->
+            <h4>Criptografia (Teste)</h4>
+            <pre id="testEncryption">Nenhum dado criptografado ainda.</pre>
         </div>
 
         <div class="col">
@@ -426,16 +412,11 @@ HTML_TEMPLATE = """
             </div>
             <div id="metrics" style="margin-top:8px"></div>
         </div>
-    </div>
+
 
     <div class="box">
         <h3>Preview das previsões</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
-    </div>
-
-    <div class="box">
-        <h3>Gráfico - Previsões vs Valor Real</h3>
-        <canvas id="predictionChart" height="120"></canvas>
     </div>
 
     <div class="box">
@@ -444,11 +425,11 @@ HTML_TEMPLATE = """
     </div>
 
 <script>
-const API_BASE = "__API_URL__";
+const API_BASE = "__API_URL__"; 
 
 function log(msg){
     const c = document.getElementById('console');
-    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
+    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent; 
 }
 
 async function uploadTrain(){
@@ -459,31 +440,13 @@ async function uploadTrain(){
     log('Enviando treino...');
     const res = await fetch(`${API_BASE}/upload/train`, { method:'POST', body: fd });
     const j = await res.json();
+
     log('Upload train: ' + JSON.stringify(j));
     document.getElementById('trainResult').innerText = JSON.stringify(j);
-}
 
-async function train() {
-    log('Iniciando treino...');
-    try {
-        const res = await fetch(`${API_BASE}/train`, {
-            method: 'POST',
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            body: new URLSearchParams({ lags: 5, cv_splits: 5 })
-        });
-
-        const text = await res.text();
-        log('Resposta bruta: ' + text);
-
-        const j = JSON.parse(text);
-        log('Treino finalizado: ' + JSON.stringify(j));
-        document.getElementById('trainResult').innerText = JSON.stringify(j);
-        getLastMetrics();
-    }
-    catch (e) {
-        log("ERRO no front: " + e);
+    // 🔵 MOSTRAR CRIPTOGRAFIA DO BACKEND
+    if(j.encrypted_preview){
+        document.getElementById("trainEncryption").textContent = j.encrypted_preview;
     }
 }
 
@@ -495,202 +458,16 @@ async function uploadTest(){
     log('Enviando teste...');
     const res = await fetch(`${API_BASE}/upload/test`, { method:'POST', body: fd });
     const j = await res.json();
+
     log('Upload test: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j);
-}
 
-async function predict(){
-    log('Rodando predict...');
-    const res = await fetch(`${API_BASE}/predict`, { method:'POST' });
-    const j = await res.json();
-    log('Predict: ' + JSON.stringify(j));
-    document.getElementById('predictResult').innerText = JSON.stringify(j);
-    await showPredictionsPreview();
-    await renderPredictionChart();
-}
-
-async function downloadPredictions(){
-    const url = `${API_BASE}/download/predictions`;
-    log('Baixando ' + url);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'predictions.csv';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-}
-
-async function getLastMetrics(){
-    try{
-        const res = await fetch(`${API_BASE}/metrics/last`);
-        const j = await res.json();
-        log('Último treino: ' + JSON.stringify(j));
-        document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
-    }catch(e){
-        log('Erro ao buscar último treino: ' + e);
+    // 🔵 MOSTRAR CRIPTOGRAFIA DO TESTE
+    if(j.encrypted_preview){
+        document.getElementById("testEncryption").textContent = j.encrypted_preview;
     }
 }
 
-let logsCache = [];
-async function getLogs(){
-    const res = await fetch(`${API_BASE}/logs`);
-    const j = await res.json();
-    logsCache = j.logs || [];
-    log('Logs recebidos: ' + logsCache.length);
-    const html = ['<table><thead><tr><th>RowKey</th><th>timestamp</th><th>MAE</th><th>RMSE</th><th>R2</th></tr></thead><tbody>'];
-    for(const it of logsCache){
-        html.push(`<tr><td>${it.RowKey}</td><td>${it.timestamp}</td><td>${it.MAE}</td><td>${it.RMSE}</td><td>${it.R2}</td></tr>`);
-    }
-    html.push('</tbody></table>');
-    document.getElementById('metrics').innerHTML = html.join('');
-}
-
-function exportLogsCSV(){
-    if(!logsCache || logsCache.length===0){ alert('Sem logs para exportar'); return; }
-    const cols = ['RowKey','timestamp','MAE','RMSE','R2'];
-    const lines = [cols.join(',')];
-    for(const it of logsCache){
-        const row = cols.map(c => JSON.stringify(it[c] ?? '')).join(',');
-        lines.push(row);
-    }
-    const blob = new Blob([lines.join('\\n')], {type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'logs_treinos.csv';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    log('Logs exportados (CSV).');
-}
-
-async function showPredictionsPreview(){
-    try{
-        const res = await fetch(`${API_BASE}/download/predictions`);
-        if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
-        const txt = await res.text();
-        const lines = txt.trim().split('\\n').slice(0, 11).join('\\n');
-        document.getElementById('predPreview').innerText = lines;
-    }catch(e){
-        log('Erro preview: ' + e);
-    }
-}
-
-async function getPredictionsTable(){
-    try{
-        const res = await fetch(`${API_BASE}/predictions/table`);
-        const j = await res.json();
-        const preds = j.predictions_table || [];
-        log('Predições Table recebidas: ' + preds.length);
-
-        const html = ['<table><thead><tr><th>ID</th><th>Training ID</th><th>Timestamp</th><th>Predicted</th><th>Lags</th></tr></thead><tbody>'];
-        for(const it of preds){
-            const lags = Object.entries(it.InputLags || {}).map(([k,v]) => `${k}:${v}`).join(', ');
-            html.push(`<tr><td>${it.RowKey}</td><td>${it.PartitionKey}</td><td>${it.timestamp}</td><td>${it.PredictedValue}</td><td>${lags}</td></tr>`);
-        }
-        html.push('</tbody></table>');
-        document.getElementById('metrics').innerHTML = '<h4>Predições Table Storage</h4>' + html.join('');
-    }catch(e){
-        log('Erro ao buscar predições Table: ' + e);
-        document.getElementById('metrics').innerText = 'Erro ao buscar predições Table: ' + e.message;
-    }
-}
-
-let predictionChartInstance = null;
-
-async function renderPredictionChart(){
-    try{
-        const res = await fetch(`${API_BASE}/download/predictions`);
-        if(!res.ok){
-            log('Sem CSV de previsões para gráfico.');
-            return;
-        }
-
-        const csv = await res.text();
-        const lines = csv.trim().split('\\n');
-        if(lines.length < 2){
-            log('CSV insuficiente para plotagem.');
-            return;
-        }
-
-        const headers = lines[0].split(',');
-        const predictedIndex = headers.indexOf('predicted');
-        const actualIndex = headers.indexOf('actual');
-
-        const labels = [];
-        const predictedData = [];
-        const actualData = [];
-
-        lines.slice(1).forEach((line, i) => {
-            const cols = line.split(',');
-            labels.push(i + 1);
-            if (predictedIndex >= 0) {
-                predictedData.push(parseFloat(cols[predictedIndex]));
-            }
-            if (actualIndex >= 0) {
-                actualData.push(parseFloat(cols[actualIndex]));
-            }
-        });
-
-        const canvas = document.getElementById('predictionChart');
-        if (!canvas){
-            log('Canvas de gráfico não encontrado no HTML.');
-            return;
-        }
-        const ctx = canvas.getContext('2d');
-
-        if (predictionChartInstance) {
-            predictionChartInstance.destroy();
-        }
-
-        predictionChartInstance = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [
-                    {
-                        label: 'Valor Previsto',
-                        data: predictedData,
-                        borderColor: '#2563eb',
-                        backgroundColor: 'rgba(37,99,235,0.15)',
-                        tension: 0.3
-                    },
-                    {
-                        label: 'Valor Real',
-                        data: actualData,
-                        borderColor: '#16a34a',
-                        backgroundColor: 'rgba(22,163,74,0.15)',
-                        tension: 0.3
-                    }
-                ]
-            },
-            options: {
-                responsive: true,
-                plugins: {
-                    legend: { display: true }
-                },
-                scales: {
-                    x: { title: { display: true, text: 'Registro' } },
-                    y: { title: { display: true, text: 'Valor' } }
-                }
-            }
-        });
-
-        log('Gráfico de previsões renderizado.');
-    }catch(e){
-        log('Erro ao gerar gráfico: ' + e);
-    }
-}
-
-log('Frontend pronto. API base: ' + API_BASE);
-
-document.addEventListener("DOMContentLoaded", () => {
-    log("Dashboard carregado.");
-});
-</script>
-</body>
-</html>
 """
 
 HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
@@ -698,7 +475,9 @@ HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
 # Rota Raiz para servir o HTML
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend_embedded():
+    # Retorna o HTML_DASHBOARD (o seu frontend)
     return HTMLResponse(content=HTML_DASHBOARD, status_code=200)
+
 
 # ============================================================
 # 4. CONFIGURAÇÃO DO AZURE STORAGE (BLOB + TABLE)
