@@ -21,7 +21,6 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from fastapi.middleware.cors import CORSMiddleware
-from cryptography.fernet import Fernet # Mantido o import aqui, mas é usado abaixo
 
 # ============================================================
 # CONFIGURAÇÕES E VARIÁVEIS
@@ -31,8 +30,6 @@ AZURE_ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
 AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "meucontainer")
 TABLE_NAME = os.getenv("TABLE_NAME", "Treinos")
 PREDICTIONS_TABLE_NAME = os.getenv("PREDICTIONS_TABLE_NAME", "Predicoes")
-RAW_CHART_BLOB_NAME = "chart_data_raw.csv" # Novo nome para o arquivo RAW de treino/teste
-RAW_PREDICTIONS_BLOB_NAME = "predictions_raw.csv" # Novo nome para o arquivo RAW de previsões
 
 if not AZURE_ACCOUNT_NAME or not AZURE_ACCOUNT_KEY:
     raise RuntimeError("Defina AZURE_ACCOUNT_NAME e AZURE_ACCOUNT_KEY como secrets.")
@@ -127,14 +124,21 @@ app.add_middleware(
 
 HTML_DASHBOARD = "<h1>ML Remote API funcionando</h1>"
 
-# Rota principal (agora abaixo, depois da definição de todas as rotas)
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTMLResponse(content=HTML_DASHBOARD, status_code=200)
 
 # ============================================================
 # CRIPTOGRAFIA - implementação simples com Fernet
+# - usamos operações "raw" para armazenar/recuperar a chave (sem tentar
+#   descriptografar com ela)
+# - upload_to_blob / download_from_blob são sobrescritas abaixo
 # ============================================================
+from cryptography.fernet import Fernet
+
 KEY_BLOB_NAME = "fernet.key"
 
-# Funções raw para manipular blobs sem criptografia (usadas para chave e para dados de gráfico RAW)
+# Funções raw para manipular blobs sem criptografia (usadas apenas para a chave)
 def raw_upload_blob(blob_name: str, data: bytes):
     try:
         blob_client = blob_container.get_blob_client(blob_name)
@@ -146,7 +150,7 @@ def raw_download_blob(blob_name: str) -> bytes:
     try:
         blob_client = blob_container.get_blob_client(blob_name)
         if not blob_client.exists():
-            raise RuntimeError(f"Blob {blob_name} não existe")
+            raise RuntimeError("Blob não existe")
         return blob_client.download_blob().readall()
     except Exception as e:
         raise RuntimeError(f"Erro raw download blob {blob_name}: {e}")
@@ -166,10 +170,13 @@ def get_crypto_key():
 FERNET = get_crypto_key()
 
 # ------------------------------------------------------
-# Sobrescrevemos as funções upload/download usadas pelo app (criptografadas)
+# Sobrescrevemos as funções upload/download usadas pelo app
+# para escrever e ler blobs criptografados.
 # ------------------------------------------------------
 def upload_to_blob(blob_name: str, data: bytes):
-    """ Envia bytes criptografados para o blob. """
+    """
+    Envia bytes criptografados para o blob.
+    """
     try:
         encrypted = FERNET.encrypt(data)
         blob_client = blob_container.get_blob_client(blob_name)
@@ -178,7 +185,9 @@ def upload_to_blob(blob_name: str, data: bytes):
         raise RuntimeError(f"Erro upload blob {blob_name}: {e}")
 
 def download_from_blob(blob_name: str) -> bytes:
-    """ Faz download do blob e descriptografa antes de retornar bytes. """
+    """
+    Faz download do blob e descriptografa antes de retornar bytes.
+    """
     try:
         blob_client = blob_container.get_blob_client(blob_name)
         if not blob_client.exists():
@@ -207,32 +216,16 @@ async def upload_train(file: UploadFile = File(...)):
     contents = await file.read()
     # valida CSV (apenas leitura)
     df = pd.read_csv(io.BytesIO(contents))
-    # salva criptografado no blob (para treino seguro)
+    # salva criptografado no blob
     upload_to_blob("train_upload.csv", contents)
-    return {"status": "ok", "rows": len(df), "columns": list(df.columns), "security": "encrypted"}
+    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
 
 @app.post("/upload/test")
 async def upload_test(file: UploadFile = File(...)):
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
-    # salva criptografado no blob (para predict seguro)
     upload_to_blob("test_upload.csv", contents)
-    return {"status": "ok", "rows": len(df), "columns": list(df.columns), "security": "encrypted"}
-
-# --- NOVO: Rota para upload de dados NÃO-CRIPTOGRAFADOS (RAW) para gráficos ---
-@app.post("/upload/chart_data")
-async def upload_chart_data(file: UploadFile = File(...)):
-    """ Salva o arquivo CSV diretamente no blob (sem criptografia) para uso em gráficos. """
-    contents = await file.read()
-    try:
-        pd.read_csv(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao ler CSV: {e}")
-
-    # salva SEM criptografia
-    raw_upload_blob(RAW_CHART_BLOB_NAME, contents)
-    return {"status": "ok", "security": "raw/no_encryption", "blob_name": RAW_CHART_BLOB_NAME}
-# --------------------------------------------------------------------------------
+    return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
 
 @app.post("/train")
 async def train_model(lags: int = Form(5), cv_splits: int = Form(5)):
@@ -285,21 +278,16 @@ async def predict(lags: int = Form(5)):
         out["actual"] = y.values[:len(preds)]
         out["error"] = out["actual"] - out["predicted"]
 
-    # salva CSV CRIPTOGRAFADO (segurança/backup)
+    # salva CSV criptografado
     b = io.BytesIO(); out.to_csv(b, index=False); upload_to_blob("predictions.csv", b.getvalue())
-
-    # --- NOVO: salva CSV de previsões NÃO-CRIPTOGRAFADO (RAW) para o gráfico ---
-    b_raw = io.BytesIO(); out.to_csv(b_raw, index=False); raw_upload_blob(RAW_PREDICTIONS_BLOB_NAME, b_raw.getvalue())
-    # --------------------------------------------------------------------------
-
     training_id = "last_run"
     for i, row in out.iterrows():
         registrar_predicao(training_id, X.iloc[i].to_dict(), float(row["predicted"]))
 
-    return {"status": "ok", "n": len(preds), "raw_predictions_blob": RAW_PREDICTIONS_BLOB_NAME}
+    return {"status": "ok", "n": len(preds)}
 
 # ============================================================
-# DOWNLOAD de previsões (descriptografado) - Original
+# DOWNLOAD de previsões (descriptografado) - mantido
 # ============================================================
 @app.get("/download/predictions")
 async def download_predictions():
@@ -326,26 +314,6 @@ async def download_decrypted(filename: str):
     # stream para o cliente
     return StreamingResponse(io.BytesIO(data), media_type="application/octet-stream",
                              headers={"Content-Disposition": f"attachment; filename={filename}"})
-
-# --- NOVO: Rota para download de dados NÃO-CRIPTOGRAFADOS (RAW) para gráficos ---
-@app.get("/download/chart_data/{filename}")
-async def download_chart_data(filename: str):
-    """
-    Baixa um arquivo de dados RAW (sem criptografia).
-    filename pode ser 'chart_data_raw.csv' ou 'predictions_raw.csv'.
-    """
-    if filename not in [RAW_CHART_BLOB_NAME, RAW_PREDICTIONS_BLOB_NAME]:
-        raise HTTPException(status_code=400, detail="Nome de arquivo RAW inválido.")
-    try:
-        # usa a função raw_download_blob
-        data = raw_download_blob(filename)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Dados de gráfico RAW ({filename}) não encontrados: {e}")
-
-    # stream para o cliente
-    return StreamingResponse(io.BytesIO(data), media_type="application/octet-stream",
-                             headers={"Content-Disposition": f"attachment; filename={filename}"})
-# --------------------------------------------------------------------------------
 
 # ============================================================
 # Predições (Table) e Logs - mantidos
@@ -392,14 +360,12 @@ async def last_metrics():
 
 @app.post("/reset")
 async def reset():
-    # Adicionando os novos arquivos RAW no reset
-    files_to_delete = ["train_upload.csv", "test_upload.csv", "model.joblib", "scaler.joblib", "predictions.csv", RAW_CHART_BLOB_NAME, RAW_PREDICTIONS_BLOB_NAME]
-    for f in files_to_delete:
+    for f in ["train_upload.csv","test_upload.csv","model.joblib","scaler.joblib","predictions.csv"]:
         delete_blob(f)
     return {"status": "reset"}
 
 # ============================================================
-# ROTAS DE CRIPTO - info e stats (mantidas)
+# ROTAS DE CRIPTO - info e stats
 # ============================================================
 @app.get("/crypto/info")
 async def crypto_info():
@@ -422,6 +388,7 @@ async def crypto_info():
 async def crypto_stats():
     """
     Retorna tamanhos criptografados vs descriptografados para alguns arquivos de exemplo.
+    Útil para mostrar 'tamanho criptografado vs descriptografado' no frontend.
     """
     sample_files = ["train_upload.csv", "test_upload.csv", "predictions.csv"]
     stats = {}
@@ -456,11 +423,9 @@ async def crypto_stats():
     return {"stats": stats}
 
 # ============================================================
-# FRONTEND EMBUTIDO (Mantido, mas com ajustes para as novas rotas)
+# FRONTEND EMBUTIDO (mantive o seu template; a URL deve ser atualizada)
 # ============================================================
 API_URL = "https://remote-ml-api.mangorock-79845fa8.centralus.azurecontainerapps.io"
-CHART_DATA_RAW = "chart_data_raw.csv"
-PREDICTIONS_RAW = "predictions_raw.csv"
 
 HTML_TEMPLATE = """
 <!doctype html>
@@ -474,7 +439,7 @@ HTML_TEMPLATE = """
         h1{margin:0 0 10px}
         .box{background:#fff;border-radius:8px;padding:14px;margin-bottom:12px;box-shadow:0 1px 4px rgba(10,10,10,0.06)}
         label{display:block;margin:8px 0 6px;font-weight:600}
-        button{padding:8px 12px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer;margin-right:5px;margin-bottom:5px;} /* Ajuste para botões */
+        button{padding:8px 12px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}
         input[type=file]{padding:6px}
         table{width:100%;border-collapse:collapse;margin-top:8px}
         th,td{padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px}
@@ -492,8 +457,7 @@ HTML_TEMPLATE = """
             <label>Arquivo de treino (.csv)</label>
             <input id="trainFile" type="file" accept=".csv" />
             <div style="margin-top:8px">
-                <button onclick="uploadTrain()">Upload Train (Cript.)</button>
-                <button onclick="uploadChartData('trainFile', '__CHART_DATA_RAW__')">Upload Gráfico (RAW)</button>
+                <button onclick="uploadTrain()">Upload Train</button>
                 <button onclick="train()">Treinar</button>
             </div>
             <div id="trainResult" style="margin-top:8px"></div>
@@ -504,12 +468,10 @@ HTML_TEMPLATE = """
             <label>Arquivo de teste (.csv)</label>
             <input id="testFile" type="file" accept=".csv" />
             <div style="margin-top:8px">
-                <button onclick="uploadTest()">Upload Teste (Cript.)</button>
+                <button onclick="uploadTest()">Upload Test</button>
                 <button onclick="predict()">Prever</button>
-                <br>
-                <button onclick="downloadPredictions()">Baixar Previsões (Cript. - Descript.)</button>
-                <button onclick="downloadRawData('__PREDICTIONS_RAW__')">Baixar Previsões (RAW)</button>
-                <button onclick="downloadRawData('__CHART_DATA_RAW__')">Baixar Treino/Teste (RAW)</button>
+                <button onclick="downloadPredictions()">Baixar Previsões (criptografado)</button>
+                <button onclick="downloadDecrypted('predictions.csv')">Baixar Previsões (descriptografado)</button>
             </div>
             <div id="predictResult" style="margin-top:8px"></div>
         </div>
@@ -535,7 +497,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="box">
-        <h3>Preview das previsões (Descript.)</h3>
+        <h3>Preview das previsões</h3>
         <div id="predPreview">Nenhuma previsão gerada ainda.</div>
     </div>
 
@@ -546,38 +508,11 @@ HTML_TEMPLATE = """
 
 <script>
 const API_BASE = "__API_URL__";
-const CHART_DATA_RAW = "__CHART_DATA_RAW__";
-const PREDICTIONS_RAW = "__PREDICTIONS_RAW__";
 
 function log(msg){
     const c = document.getElementById('console');
-    c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
+    c.textContent = `${new Date().toISOString()} — ${msg}\\n` + c.textContent;
 }
-
-// ----------------------------------------------------
-// Novas Funções RAW
-// ----------------------------------------------------
-async function uploadChartData(fileId, targetBlob){
-    const f = document.getElementById(fileId).files[0];
-    if(!f){ alert(`Selecione o CSV (${fileId})`); return; }
-    const fd = new FormData();
-    fd.append('file', f);
-    log('Enviando dados para gráfico (será salvo RAW)...');
-    const res = await fetch(`${API_BASE}/upload/chart_data`, { method:'POST', body: fd });
-    const j = await res.json();
-    log('Upload chart data (RAW): ' + JSON.stringify(j));
-}
-
-async function downloadRawData(filename){
-    const a = document.createElement('a');
-    a.href = `${API_BASE}/download/chart_data/${filename}`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    log('Solicitado download RAW: ' + filename);
-}
-// ----------------------------------------------------
 
 async function uploadTrain(){
     const f = document.getElementById('trainFile').files[0];
@@ -624,14 +559,14 @@ async function predict(){
 }
 
 async function downloadPredictions(){
-    // baixa o arquivo predictions.csv criptografado e o servidor o descriptografa
+    // baixa o arquivo criptografado (como está armazenado) - frontend não precisa descriptografar
     const a = document.createElement('a');
     a.href = `${API_BASE}/download/predictions`;
-    a.download = 'predictions_decrypted.csv';
+    a.download = 'predictions.csv';
     document.body.appendChild(a);
     a.click();
     a.remove();
-    log('Solicitado download (predictions.csv) - Descriptografado.');
+    log('Solicitado download (predictions.csv) - o servidor fornece o arquivo descriptografado via /download/predictions.');
 }
 
 async function downloadDecrypted(filename){
@@ -668,15 +603,24 @@ async function getCryptoStats(){
 
 async function showPredictionsPreview(){
     try{
-        const res = await fetch(`${API_BASE}/download/predictions`);
-        if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
+        // usa a rota de download descriptografado
+        const res = await fetch(`${API_BASE}/download/decrypted/predictions.csv`);
+        if(!res.ok){ 
+            log('Nenhuma previsão disponível.'); 
+            document.getElementById('predPreview').innerText = 'Nenhuma previsão disponível.';
+            return; 
+        }
         const txt = await res.text();
-        const lines = txt.trim().split('\n').slice(0, 11).join('\n');
-        document.getElementById('predPreview').innerText = lines;
+        const lines = txt.trim().split('\n');
+        // mostra apenas as 10 primeiras linhas (cabeçalho + 9 valores)
+        const preview = lines.slice(0, 10).join('\n');
+        document.getElementById('predPreview').innerText = preview;
     }catch(e){
         log('Erro preview: ' + e);
+        document.getElementById('predPreview').innerText = 'Erro ao carregar preview.';
     }
 }
+
 
 async function getLogs(){
     const res = await fetch(`${API_BASE}/logs`);
@@ -685,27 +629,13 @@ async function getLogs(){
     log('Logs carregados.');
 }
 
-async function getPredictionsTable(){
-    const res = await fetch(`${API_BASE}/predictions/table`);
-    const j = await res.json();
-    document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
-    log('Tabela de predições carregada.');
-}
-
-async function getLastMetrics(){
-    const res = await fetch(`${API_BASE}/metrics/last`);
-    const j = await res.json();
-    document.getElementById('metrics').innerText = JSON.stringify(j, null, 2);
-    log('Últimas métricas carregadas.');
-}
-
 log('Frontend pronto. API base: ' + API_BASE);
 </script>
 </body>
 </html>
 """
 
-HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL).replace("__CHART_DATA_RAW__", RAW_CHART_BLOB_NAME).replace("__PREDICTIONS_RAW__", RAW_PREDICTIONS_BLOB_NAME)
+HTML_DASHBOARD = HTML_TEMPLATE.replace("__API_URL__", API_URL)
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend_embedded():
