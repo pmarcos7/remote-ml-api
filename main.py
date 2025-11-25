@@ -451,82 +451,80 @@ HTML_TEMPLATE = """
         .row{display:flex;gap:12px;flex-wrap:wrap}
         .col{flex:1;min-width:240px}
         pre{background:#0b1220;color:#dbeafe;padding:10px;border-radius:6px;overflow:auto}
+        canvas{background:#fff;border-radius:8px;display:block;margin-top:12px}
     </style>
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
-<h1>ML Remote — Dashboard</h1>
+    <h1>ML Remote — Dashboard</h1>
 
-<div class="box row">
-    <div class="col">
-        <h3>1) Upload e Treino</h3>
-        <label>Arquivo de treino (.csv)</label>
-        <input id="trainFile" type="file" accept=".csv" />
-        <div style="margin-top:8px">
-            <button onclick="uploadTrain()">Upload Train</button>
-            <button onclick="train()">Treinar</button>
+    <div class="box row">
+        <div class="col">
+            <h3>1) Upload e Treino</h3>
+            <label>Arquivo de treino (.csv)</label>
+            <input id="trainFile" type="file" accept=".csv" />
+            <div style="margin-top:8px">
+                <button onclick="uploadTrain()">Upload Train</button>
+                <button onclick="train()">Treinar</button>
+            </div>
+            <div id="trainResult" style="margin-top:8px"></div>
         </div>
-        <div id="trainResult" style="margin-top:8px"></div>
+
+        <div class="col">
+            <h3>2) Upload teste e Previsão</h3>
+            <label>Arquivo de teste (.csv)</label>
+            <input id="testFile" type="file" accept=".csv" />
+            <div style="margin-top:8px">
+                <button onclick="uploadTest()">Upload Test</button>
+                <button onclick="predict()">Prever</button>
+                <button onclick="downloadPredictions()">Baixar Previsões (criptografado)</button>
+                <button onclick="downloadDecrypted('predictions.csv')">Baixar Previsões (descriptografado)</button>
+            </div>
+            <div id="predictResult" style="margin-top:8px"></div>
+        </div>
+
+        <div class="col">
+            <h3>3) Logs e Métricas</h3>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <button onclick="getLastMetrics()">Último treino (Table)</button>
+                <button onclick="getLogs()">Ver logs (Table)</button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+                <button onclick="getPredictionsTable()">Ver predições (Table)</button>
+            </div>
+            <div id="metrics" style="margin-top:8px"></div>
+        </div>
     </div>
 
-    <div class="col">
-        <h3>2) Upload teste e Previsão</h3>
-        <label>Arquivo de teste (.csv)</label>
-        <input id="testFile" type="file" accept=".csv" />
-        <div style="margin-top:8px">
-            <button onclick="uploadTest()">Upload Test</button>
-            <button onclick="predict()">Prever</button>
-            <button onclick="downloadPredictions()">Baixar Previsões (criptografado)</button>
-            <button onclick="downloadDecrypted('predictions.csv')">Baixar Previsões (descriptografado)</button>
-        </div>
-        <div id="predictResult" style="margin-top:8px"></div>
+    <div class="box">
+        <h3>Criptografia</h3>
+        <button onclick="getCryptoInfo()">Ver detalhes da criptografia</button>
+        <button onclick="getCryptoStats()">Tamanhos (criptografado vs descriptografado)</button>
+        <pre id="cryptoInfo">Nenhuma informação carregada ainda.</pre>
     </div>
 
-    <div class="col">
-        <h3>3) Logs e Métricas</h3>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
-            <button onclick="getLastMetrics()">Último treino (Table)</button>
-            <button onclick="getLogs()">Ver logs (Table)</button>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center">
-            <button onclick="getPredictionsTable()">Ver predições (Table)</button>
-        </div>
-        <div id="metrics" style="margin-top:8px"></div>
+    <div class="box">
+        <h3>Preview das previsões</h3>
+        <div id="predPreview">Nenhuma previsão gerada ainda.</div>
+        <canvas id="predChart" width="400" height="200"></canvas>
     </div>
-</div>
 
-<div class="box">
-    <h3>Criptografia</h3>
-    <button onclick="getCryptoInfo()">Ver detalhes da criptografia</button>
-    <button onclick="getCryptoStats()">Tamanhos (criptografado vs descriptografado)</button>
-    <pre id="cryptoInfo">Nenhuma informação carregada ainda.</pre>
-</div>
+    <div class="box">
+        <h3>Console</h3>
+        <pre id="console">Pronto.</pre>
+    </div>
 
-<div class="box">
-    <h3>Preview das previsões</h3>
-    <div id="predPreview">Nenhuma previsão gerada ainda.</div>
-</div>
-
-<div class="box">
-    <h3>Gráfico de Série Temporal</h3>
-    <canvas id="timeSeriesChart" width="800" height="400"></canvas>
-</div>
-
-<div class="box">
-    <h3>Console</h3>
-    <pre id="console">Pronto.</pre>
-</div>
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <script>
 const API_BASE = "__API_URL__";
-let timeSeriesChart = null;
 
 function log(msg){
     const c = document.getElementById('console');
     c.textContent = `${new Date().toISOString()} — ${msg}\n` + c.textContent;
 }
 
+// === Funções globais para botões ===
 async function uploadTrain(){
     const f = document.getElementById('trainFile').files[0];
     if(!f){ alert('Selecione o CSV de treino'); return; }
@@ -568,7 +566,43 @@ async function predict(){
     const j = await res.json();
     log('Predict: ' + JSON.stringify(j));
     document.getElementById('predictResult').innerText = JSON.stringify(j, null, 2);
-    await showPredictionsPreview();
+
+    // Gerar gráfico
+    try {
+        const csvRes = await fetch(`${API_BASE}/download/predictions`);
+        const txt = await csvRes.text();
+        const lines = txt.trim().split('\n');
+        const header = lines.shift().split(',');
+        const predictedIndex = header.indexOf('predicted');
+        const actualIndex = header.indexOf('actual');
+        const labels = [];
+        const predictedData = [];
+        const actualData = [];
+        lines.forEach((line,i)=>{
+            const cols = line.split(',');
+            labels.push(i+1);
+            predictedData.push(parseFloat(cols[predictedIndex]));
+            actualData.push(actualIndex>=0 ? parseFloat(cols[actualIndex]) : null);
+        });
+
+        const ctx = document.getElementById('predChart').getContext('2d');
+        if(window.predChartObj) window.predChartObj.destroy(); // destrói se existir
+        window.predChartObj = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {label:'Predito', data: predictedData, borderColor:'rgb(54, 162, 235)', fill:false, tension:0.1},
+                    {label:'Real', data: actualData, borderColor:'rgb(255, 99, 132)', fill:false, tension:0.1}
+                ]
+            },
+            options: {
+                responsive:true,
+                plugins: {legend:{position:'top'}},
+                scales: {x:{title:{display:true,text:'Index'}}, y:{title:{display:true,text:'Valor'}}}
+            }
+        });
+    } catch(e){ log('Erro ao gerar gráfico: '+e); }
 }
 
 async function downloadPredictions(){
@@ -591,67 +625,22 @@ async function downloadDecrypted(filename){
     log('Solicitado download descriptografado: ' + filename);
 }
 
-async function showPredictionsPreview(){
+async function getCryptoInfo(){
     try{
-        const res = await fetch(`${API_BASE}/download/predictions`);
-        if(!res.ok){ log('Nenhuma previsão disponível.'); return; }
-        const txt = await res.text();
-        const lines = txt.trim().split('\n');
-        const headers = lines[0].split(',');
-        const data = lines.slice(1).map(line => {
-            const parts = line.split(',');
-            const obj = {};
-            headers.forEach((h,i)=>{ obj[h]=parseFloat(parts[i]); });
-            return obj;
-        });
+        const res = await fetch(`${API_BASE}/crypto/info`);
+        const j = await res.json();
+        document.getElementById('cryptoInfo').innerText = JSON.stringify(j, null, 2);
+        log('Crypto info carregada.');
+    }catch(e){ log('Erro crypto info: '+e); }
+}
 
-        // Preview simples
-        const previewLines = lines.slice(0, 11).join('\n');
-        document.getElementById('predPreview').innerText = previewLines;
-
-        // Dados para gráfico
-        const labels = data.map((_,i)=>i+1);
-        const predicted = data.map(r => r.predicted);
-        const actual = data.map(r => r.actual);
-
-        const ctx = document.getElementById('timeSeriesChart').getContext('2d');
-        if(timeSeriesChart) timeSeriesChart.destroy();
-
-        timeSeriesChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: labels,
-                datasets: [
-                    {
-                        label: 'Predito',
-                        data: predicted,
-                        borderColor: 'rgba(75, 192, 192, 1)',
-                        backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                        fill: false,
-                        tension: 0.1
-                    },
-                    {
-                        label: 'Real',
-                        data: actual,
-                        borderColor: 'rgba(255, 99, 132, 1)',
-                        backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                        fill: false,
-                        tension: 0.1
-                    }
-                ]
-            },
-            options: {
-                responsive: true,
-                plugins: { legend: { display: true } },
-                scales: {
-                    x: { title: { display: true, text: 'Índice / Tempo' } },
-                    y: { title: { display: true, text: 'Valor' } }
-                }
-            }
-        });
-    }catch(e){
-        log('Erro preview: ' + e);
-    }
+async function getCryptoStats(){
+    try{
+        const res = await fetch(`${API_BASE}/crypto/stats`);
+        const j = await res.json();
+        document.getElementById('cryptoInfo').innerText = JSON.stringify(j, null, 2);
+        log('Crypto stats carregada.');
+    }catch(e){ log('Erro crypto stats: '+e); }
 }
 
 async function getLogs(){
@@ -661,10 +650,22 @@ async function getLogs(){
     log('Logs carregados.');
 }
 
+// Força funções para escopo global
+window.uploadTrain = uploadTrain;
+window.uploadTest = uploadTest;
+window.train = train;
+window.predict = predict;
+window.downloadPredictions = downloadPredictions;
+window.downloadDecrypted = downloadDecrypted;
+window.getCryptoInfo = getCryptoInfo;
+window.getCryptoStats = getCryptoStats;
+window.getLogs = getLogs;
+
 log('Frontend pronto. API base: ' + API_BASE);
 </script>
 </body>
 </html>
+
 
 """
 
