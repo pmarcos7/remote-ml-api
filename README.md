@@ -16,7 +16,7 @@ Sistema de Machine Learning remoto com dashboard interativo para treinamento, te
 ## 👥 Equipe
 
 * Leonardo de camargo rosa  — 23909872 — leonardo.cr4@puccampinas.edu.br
-* Nome do aluno 2 — Matrícula — E-mail
+* Lucas Bastos Oliveira do Carmo - 23001623  - lucas.boc@puccampinas.edu.br
   *(Adicione mais integrantes se necessário)*
 
 ---
@@ -128,9 +128,7 @@ E --> F[Modelo Preditivo]
 
 ## Demonstração
 
-### 📸 Capturas de Tela
-
-Insira imagens do sistema em funcionamento:
+Imagens do sistema em funcionamento:
 
 <img width="700" height="450" alt="Captura de Tela 2025-11-26 às 14 51 35" src="https://github.com/user-attachments/assets/bdca644e-5132-4ff2-874c-b2768352cf37" />
 
