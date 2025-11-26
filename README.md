@@ -134,6 +134,12 @@ Insira imagens do sistema em funcionamento:
 
 <img width="700" height="450" alt="Captura de Tela 2025-11-26 às 14 51 35" src="https://github.com/user-attachments/assets/bdca644e-5132-4ff2-874c-b2768352cf37" />
 
+<img width="700" height="450" alt="Captura de Tela 2025-11-26 às 14 58 35" src="https://github.com/user-attachments/assets/762fa3b8-9bec-4bd9-aac8-980b0cba6d46" />
+
+<img width="700" height="450" alt="Captura de Tela 2025-11-26 às 14 59 18" src="https://github.com/user-attachments/assets/822a0ed3-8c04-42b9-997a-a9cc0d2cc42f" />
+
+<img width="700" height="450" alt="Captura de Tela 2025-11-26 às 14 59 43" src="https://github.com/user-attachments/assets/c41167c8-bc2a-4fa3-92f7-09fcc8bcf3d4" />
+
 
 ### ▶️ Vídeo de Demonstração
 
