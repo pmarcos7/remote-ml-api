@@ -16,8 +16,9 @@ Sistema de Machine Learning remoto com dashboard interativo para treinamento, te
 ## 👥 Equipe
 
 * Leonardo de camargo rosa  — 23909872 — leonardo.cr4@puccampinas.edu.br
-* Lucas Bastos Oliveira do Carmo - 23001623  - lucas.boc@puccampinas.edu.br
-  *(Adicione mais integrantes se necessário)*
+* Lucas Bastos Oliveira do Carmo -- 23001623  -- lucas.boc@puccampinas.edu.br
+* Pedro Enrico da Silva Serradilha  -- 23025381 --  pedro.ess2@puccampinas.edu.br
+* Paulo Marcos da Costa Silveira filho -- 23881105 
 
 ---
 
