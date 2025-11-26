@@ -143,7 +143,7 @@ Imagens do sistema em funcionamento:
 
 Link para vídeo:
 
-* Youtube: []
+* Youtube: [https://youtu.be/lWXfhzHNL2w](https://youtu.be/lWXfhzHNL2w)
 
 ---
 
